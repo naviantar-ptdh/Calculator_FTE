@@ -180,14 +180,25 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     } if not rs_block.empty else {}
 
     # --- RACI proportion (Mechanic, Electrician, Welder) ---
+    # --- RACI proportion (Mechanic, Electrician, Welder) ---
     raci_title_row = _find_label_row(raw, "RACI", start=rs_header_row)
     raci_header_row = raci_title_row + 1
-    raci_data_row = raci_header_row + 1
+    
+    # Membaca data RACI secara dinamis sebanyak 3 kolom ke kanan
+    raci_block = _read_block(raw, raci_header_row + 1, 3)
+    if raci_block.empty:
+        raise BackendDataError("Tabel RACI pada BACKEND tidak ditemukan atau kosong.")
+        
+    # Mengambil nilai numerik pertama dari masing-masing kolom dengan aman
     raci = {
-        "Mechanic": _to_float(_cell(raw, raci_data_row, 0)),
-        "Electric": _to_float(_cell(raw, raci_data_row, 1)),
-        "Welder": _to_float(_cell(raw, raci_data_row, 2)),
+        "Mechanic": _to_float(raci_block.iloc[0, 0]),
+        "Electric": _to_float(raci_block.iloc[0, 1]),
+        "Welder": _to_float(raci_block.iloc[0, 2]),
     }
+    
+    # Jika Electrician kosong di kolom ke-2, coba cari fallback di kolom ke-4 (indeks 3) akibat pergeseran visual
+    if raci["Electric"] is None and raci_block.shape[1] > 3:
+        raci["Electric"] = _to_float(raci_block.iloc[0, 3])
 
     # --- Split ratio Mechanic (M1, M2, M3) ---
     m_title_row = _find_label_row(raw, "Mechanic", start=raci_data_row, match_other_cols_empty=True)
