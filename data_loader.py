@@ -1,26 +1,26 @@
 # data_loader.py
 """
-Robust BACKEND CSV parser for Calculator_FTE.
+Robust BACKEND CSV loader + parser for Calculator_FTE.
 
 Provides:
  - BackendData dataclass
  - BackendDataError exception
- - load_backend_data(source)  -> BackendData
+ - load_backend_data(source=None)  -> BackendData
  - parse_backend(raw: pd.DataFrame) -> BackendData
 
-Usage examples:
-    from data_loader import load_backend_data, BackendDataError
-    try:
-        backend = load_backend_data("FTE - BACKEND (2).csv")
-    except BackendDataError as e:
-        # handle error
-        raise
+load_backend_data accepts:
+ - None (will try env vars / default file / Google Sheets export)
+ - str (file path or URL)
+ - pandas.DataFrame (already loaded)
+
+If you call load_backend_data() with no args (as in your app), it will attempt sensible fallbacks.
 """
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 import pandas as pd
 import math
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +73,8 @@ def _safe_float(value: Optional[Union[str, float, int]]) -> float:
     if s == "" or s.lower() in {"nan", "none"}:
         return math.nan
     s = s.replace("%", "").replace(" ", "")
-    # treat single comma as decimal separator if no dot present
     if "," in s and "." not in s and s.count(",") == 1:
         s = s.replace(",", ".")
-    # remove thousands commas remaining
     s = s.replace(",", "")
     try:
         return float(s)
@@ -120,7 +118,14 @@ def _find_first_row_matching_any(rows_text: List[str], keywords: List[str], star
     return None
 
 
+# -----------------------
+# Main parser
+# -----------------------
 def parse_backend(raw: pd.DataFrame) -> BackendData:
+    """
+    Parse the BACKEND CSV (loaded into DataFrame raw, header=None or arbitrary).
+    Returns BackendData with parsed pieces.
+    """
     try:
         df = raw.copy().reset_index(drop=True)
         rows_text = [_row_to_text(df.iloc[i]) for i in range(len(df))]
@@ -359,31 +364,87 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
             split_electrician=split_electrician,
             lost_time=lost_time,
         )
-
     except Exception as e:
         logger.exception("Failed to parse backend data")
         raise BackendDataError("Failed to parse backend data") from e
 
 
-def load_backend_data(source: Union[str, pd.DataFrame]) -> BackendData:
+# -----------------------
+# Loader with fallbacks
+# -----------------------
+def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> BackendData:
     """
-    Load backend data either from:
-     - a file path to CSV (str)
-     - a pandas.DataFrame (already loaded)
+    Load backend data from:
+     - pandas.DataFrame (if provided)
+     - str path or URL (if provided)
+     - None: try env var BACKEND_CSV_PATH, then BACKEND_CSV_URL, then default file name,
+             then Google Sheets export URL (uses sheet id/gid known from your message).
 
-    The CSV should be the Google Sheets export of the BACKEND tab (no header or arbitrary header).
+    Returns BackendData or raises BackendDataError.
     """
+    # Google Sheet info from your earlier message (used as last-resort)
+    GOOGLE_SHEET_ID = "1YRvXt0AE-dVBVwRvLtsb57Qz8DYd9YbVQlVbRD31C7I"
+    GOOGLE_SHEET_GID = "1437049322"
+    google_export_url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={GOOGLE_SHEET_GID}"
+
     try:
         if isinstance(source, pd.DataFrame):
             raw = source
-        elif isinstance(source, str):
-            # read CSV defensively: no header, all strings
-            raw = pd.read_csv(source, header=None, dtype=str)
-        else:
-            raise BackendDataError("Unsupported source type for load_backend_data")
-        return parse_backend(raw)
+            return parse_backend(raw)
+
+        # if a path/url provided
+        if isinstance(source, str):
+            src = source.strip()
+            try:
+                raw = pd.read_csv(src, header=None, dtype=str)
+            except Exception as e:
+                logger.debug("Failed reading source %r via pandas: %s", src, e)
+                # try read via requests if URL and pandas failed (optional)
+                raise BackendDataError(f"Failed to read CSV from {src}") from e
+            return parse_backend(raw)
+
+        # source is None -> try env var path
+        env_path = os.getenv("BACKEND_CSV_PATH")
+        if env_path:
+            try:
+                raw = pd.read_csv(env_path, header=None, dtype=str)
+                return parse_backend(raw)
+            except Exception as e:
+                logger.warning("Failed to read BACKEND_CSV_PATH=%r: %s", env_path, e)
+
+        # env var URL
+        env_url = os.getenv("BACKEND_CSV_URL")
+        if env_url:
+            try:
+                raw = pd.read_csv(env_url, header=None, dtype=str)
+                return parse_backend(raw)
+            except Exception as e:
+                logger.warning("Failed to read BACKEND_CSV_URL=%r: %s", env_url, e)
+
+        # default local filename
+        default_fname = "FTE - BACKEND (2).csv"
+        if os.path.exists(default_fname):
+            try:
+                raw = pd.read_csv(default_fname, header=None, dtype=str)
+                return parse_backend(raw)
+            except Exception as e:
+                logger.warning("Failed to read default CSV %r: %s", default_fname, e)
+
+        # final fallback: attempt direct Google Sheets export URL
+        try:
+            raw = pd.read_csv(google_export_url, header=None, dtype=str)
+            return parse_backend(raw)
+        except Exception as e:
+            logger.exception("Failed to fetch Google Sheets export CSV from %s", google_export_url)
+
+        # nothing worked
+        raise BackendDataError(
+            "Could not load BACKEND CSV: tried BACKEND_CSV_PATH, BACKEND_CSV_URL, "
+            f"default file {default_fname}, and Google Sheets export URL."
+        )
+
     except BackendDataError:
         raise
     except Exception as e:
-        logger.exception("Error loading backend data from source=%r", source)
-        raise BackendDataError("Error loading backend data") from e
+        logger.exception("Unexpected error in load_backend_data")
+        raise BackendDataError("Unexpected error loading backend data") from e
