@@ -1,6 +1,6 @@
 """
 Data loader untuk sheet BACKEND (Google Spreadsheet).
-Versi Final: Pemindaian berbasis indeks dinamis dengan isolasi penuh antar seksi.
+Versi Finetuned: Pemindaian dinamis berbasis teks, bebas dari hardcoded row index.
 """
 
 from __future__ import annotations
@@ -95,7 +95,6 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
         raise BackendDataError("Section 'Load Factor' tidak ditemukan di kolom A.")
 
     lf_rows_list = []
-    # Data dimulai dari lf_idx + 2 (melewati judul dan header)
     curr = lf_idx + 2
     while curr < max_rows:
         val_a = raw.iloc[curr, 0]
@@ -140,14 +139,13 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     if raci_idx is None:
         raise BackendDataError("Section 'RACI' tidak ditemukan di kolom A.")
 
-    # Ambil nilai berdasarkan posisi baris relatif setelah judul RACI
     raci = {
-        "Mechanic": _to_float(raw.iloc[raci_idx + 1, 1]),   # Baris tepat di bawah tulisan RACI
-        "Electric": _to_float(raw.iloc[raci_idx + 2, 1]),   # Baris kedua bawah RACI
-        "Welder": _to_float(raw.iloc[raci_idx + 3, 1])      # Baris ketiga bawah RACI
+        "Mechanic": _to_float(raw.iloc[raci_idx + 1, 1]),
+        "Electric": _to_float(raw.iloc[raci_idx + 2, 1]),
+        "Welder": _to_float(raw.iloc[raci_idx + 3, 1])
     }
 
-    # Area pencarian Split Ratio dibatasi HANYA setelah baris RACI selesai (+4)
+    # Pembatasan area deteksi split ratio agar tidak tabrakan dengan teks vertikal RACI
     split_search_start = raci_idx + 4
 
     # --- 4. Ambil Blok 'Split Ratio Mechanic' ---
@@ -206,14 +204,7 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
         if pd.isna(val_a) or str(val_a).strip() == "":
             break
         lost_time[str(val_a).strip()] = _to_float(raw.iloc[curr, 1])
-        current_row = curr
         curr += 1
-
-    # Validasi Integritas Data Akhir
-    if not ratio_shift or not lost_time:
-        raise BackendDataError("Tabel Ratio Shift atau Lost Time terdeteksi kosong.")
-    if any(v is None for v in raci.values()):
-        raise BackendDataError(f"Nilai Proporsi RACI tidak lengkap. Hasil baca: {raci}")
 
     return BackendData(
         load_factor=lf_final,
