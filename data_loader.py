@@ -1,6 +1,6 @@
 """
 Data loader untuk sheet BACKEND (Google Spreadsheet).
-Versi final: Bebas bug substring matching, kebal spasi gaib, dan adaptif terhadap baris kosong Google Sheets.
+Versi Final: Pemindaian berbasis indeks dinamis dengan isolasi penuh antar seksi.
 """
 
 from __future__ import annotations
@@ -56,7 +56,6 @@ def _fetch_raw_csv(sheet_name: str = BACKEND_SHEET_NAME, spreadsheet_id: str = S
 
     try:
         df = pd.read_csv(io.StringIO(resp.text), header=None)
-        # Saring spasi tak terlihat di setiap sel berjenis teks
         df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     except Exception as exc:
         raise BackendDataError(f"Gagal parsing CSV dari sheet {sheet_name}: {exc}") from exc
@@ -77,157 +76,144 @@ def _to_float(val, default=None) -> float:
         return default
 
 
-def _clean_cell_str(raw: pd.DataFrame, row: int, col: int) -> str:
-    """Mengambil string sel dan membersihkannya dari spasi untuk pencocokan judul."""
-    if row < 0 or row >= raw.shape[0] or col < 0 or col >= raw.shape[1]:
-        return ""
-    val = raw.iloc[row, col]
+def _clean_str(val) -> str:
     if pd.isna(val):
         return ""
     return str(val).strip().lower()
 
 
 def parse_backend(raw: pd.DataFrame) -> BackendData:
-    """
-    Memecah file DataFrame mentah menjadi blok-blok tabel secara berurutan ke bawah.
-    Menggunakan teknik sekuensial agar terhindar dari bentrokan nama kolom/header yang serupa.
-    """
-    current_row = 0
     max_rows = raw.shape[0]
 
     # --- 1. Ambil Blok 'Load Factor' ---
-    # Cari judul Load Factor dari atas
-    while current_row < max_rows and "load factor" not in _clean_cell_str(raw, current_row, 0):
-        current_row += 1
-        
-    if current_row >= max_rows:
-        raise BackendDataError("Judul section 'Load Factor' tidak ditemukan di kolom A.")
-    
-    # Header tabel berada 1 baris di bawah judul, datanya dimulai 2 baris di bawah judul
-    current_row += 2 
-    lf_rows_list = []
-    while current_row < max_rows:
-        sub_cat = raw.iloc[current_row, 0]
-        # Berhenti jika menemukan baris pembatas kosong atau bertemu tabel berikutnya
-        if pd.isna(sub_cat) or str(sub_cat).strip() == "" or "ratio shift" in str(sub_cat).lower():
+    lf_idx = None
+    for r in range(max_rows):
+        if "load factor" in _clean_str(raw.iloc[r, 0]):
+            lf_idx = r
             break
-        
+    if lf_idx is None:
+        raise BackendDataError("Section 'Load Factor' tidak ditemukan di kolom A.")
+
+    lf_rows_list = []
+    # Data dimulai dari lf_idx + 2 (melewati judul dan header)
+    curr = lf_idx + 2
+    while curr < max_rows:
+        val_a = raw.iloc[curr, 0]
+        if pd.isna(val_a) or str(val_a).strip() == "" or "ratio shift" in _clean_str(val_a):
+            break
         lf_rows_list.append([
-            str(sub_cat).strip(),
-            raw.iloc[current_row, 1],
-            _to_float(raw.iloc[current_row, 2]),
-            _to_float(raw.iloc[current_row, 3]),
-            _to_float(raw.iloc[current_row, 4])
+            str(val_a).strip(),
+            raw.iloc[curr, 1],
+            _to_float(raw.iloc[curr, 2]),
+            _to_float(raw.iloc[curr, 3]),
+            _to_float(raw.iloc[curr, 4])
         ])
-        current_row += 1
-
+        curr += 1
+    
     lf_df = pd.DataFrame(lf_rows_list, columns=["Sub Category", "Attribute", "Load Mechanic", "Load Electrican", "Load Welder"])
-    lf_df = lf_df.dropna(subset=["Sub Category"])
-    lf_final = lf_df.set_index("Sub Category")
-
+    lf_final = lf_df.dropna(subset=["Sub Category"]).set_index("Sub Category")
 
     # --- 2. Ambil Blok 'Ratio Shift' ---
-    while current_row < max_rows and "ratio shift" not in _clean_cell_str(raw, current_row, 0):
-        current_row += 1
-        
-    if current_row >= max_rows:
-        raise BackendDataError("Judul section 'Ratio Shift' tidak ditemukan.")
-        
-    current_row += 2  # Lewati judul dan header kolom
-    ratio_shift = {}
-    while current_row < max_rows:
-        site_val = raw.iloc[current_row, 0]
-        if pd.isna(site_val) or str(site_val).strip() == "" or "raci" in str(site_val).lower():
+    rs_idx = None
+    for r in range(max_rows):
+        if "ratio shift" in _clean_str(raw.iloc[r, 0]):
+            rs_idx = r
             break
-        ratio_shift[str(site_val).strip()] = _to_float(raw.iloc[current_row, 1])
-        current_row += 1
+    if rs_idx is None:
+        raise BackendDataError("Section 'Ratio Shift' tidak ditemukan di kolom A.")
 
+    ratio_shift = {}
+    curr = rs_idx + 2
+    while curr < max_rows:
+        val_a = raw.iloc[curr, 0]
+        if pd.isna(val_a) or str(val_a).strip() == "" or "raci" in _clean_str(val_a):
+            break
+        ratio_shift[str(val_a).strip()] = _to_float(raw.iloc[curr, 1])
+        curr += 1
 
     # --- 3. Ambil Blok 'RACI' ---
-    while current_row < max_rows and "raci" not in _clean_cell_str(raw, current_row, 0):
-        current_row += 1
-        
-    if current_row >= max_rows:
-        raise BackendDataError("Judul section 'RACI' tidak ditemukan.")
-        
-    current_row += 2  # Lewati judul 'RACI' dan baris headernya
-    
-    # Ambil nilai RACI secara berurutan baris demi baris (Mechanic, Electrician, Welder)
-    raci = {
-        "Mechanic": _to_float(raw.iloc[current_row, 1]),
-        "Electric": _to_float(raw.iloc[current_row + 1, 1]),
-        "Welder": _to_float(raw.iloc[current_row + 2, 1])
-    }
-    current_row += 3
+    raci_idx = None
+    for r in range(max_rows):
+        if _clean_str(raw.iloc[r, 0]) == "raci":
+            raci_idx = r
+            break
+    if raci_idx is None:
+        raise BackendDataError("Section 'RACI' tidak ditemukan di kolom A.")
 
+    # Ambil nilai berdasarkan posisi baris relatif setelah judul RACI
+    raci = {
+        "Mechanic": _to_float(raw.iloc[raci_idx + 1, 1]),   # Baris tepat di bawah tulisan RACI
+        "Electric": _to_float(raw.iloc[raci_idx + 2, 1]),   # Baris kedua bawah RACI
+        "Welder": _to_float(raw.iloc[raci_idx + 3, 1])      # Baris ketiga bawah RACI
+    }
+
+    # Area pencarian Split Ratio dibatasi HANYA setelah baris RACI selesai (+4)
+    split_search_start = raci_idx + 4
 
     # --- 4. Ambil Blok 'Split Ratio Mechanic' ---
-    while current_row < max_rows and "mechanic" not in _clean_cell_str(raw, current_row, 0):
-        current_row += 1
-        
-    if current_row >= max_rows:
-        raise BackendDataError("Judul section split ratio 'Mechanic' tidak ditemukan setelah tabel RACI.")
-        
-    current_row += 1  # Baris data split tepat di bawah judulnya
+    m_idx = None
+    for r in range(split_search_start, max_rows):
+        if _clean_str(raw.iloc[r, 0]) == "mechanic":
+            m_idx = r
+            break
+    if m_idx is None:
+        raise BackendDataError("Judul Split Ratio 'Mechanic' tidak ditemukan setelah tabel RACI.")
     split_mechanic = (
-        _to_float(raw.iloc[current_row, 0], 0.0),
-        _to_float(raw.iloc[current_row, 1], 0.0),
-        _to_float(raw.iloc[current_row, 2], 0.0)
+        _to_float(raw.iloc[m_idx + 1, 0], 0.0),
+        _to_float(raw.iloc[m_idx + 1, 1], 0.0),
+        _to_float(raw.iloc[m_idx + 1, 2], 0.0)
     )
-    current_row += 1
-
 
     # --- 5. Ambil Blok 'Split Ratio Welder' ---
-    while current_row < max_rows and "welder" not in _clean_cell_str(raw, current_row, 0):
-        current_row += 1
-        
-    if current_row >= max_rows:
-        raise BackendDataError("Judul section split ratio 'Welder' tidak ditemukan.")
-        
-    current_row += 1
+    w_idx = None
+    for r in range(m_idx + 2, max_rows):
+        if _clean_str(raw.iloc[r, 0]) == "welder":
+            w_idx = r
+            break
+    if w_idx is None:
+        raise BackendDataError("Judul Split Ratio 'Welder' tidak ditemukan.")
     split_welder = (
-        _to_float(raw.iloc[current_row, 0], 0.0),
-        _to_float(raw.iloc[current_row, 1], 0.0)
+        _to_float(raw.iloc[w_idx + 1, 0], 0.0),
+        _to_float(raw.iloc[w_idx + 1, 1], 0.0)
     )
-    current_row += 1
-
 
     # --- 6. Ambil Blok 'Split Ratio Electrician' ---
-    while current_row < max_rows and "electrician" not in _clean_cell_str(raw, current_row, 0):
-        current_row += 1
-        
-    if current_row >= max_rows:
-        raise BackendDataError("Judul section split ratio 'Electrician' tidak ditemukan.")
-        
-    current_row += 1
+    e_idx = None
+    for r in range(w_idx + 2, max_rows):
+        if _clean_str(raw.iloc[r, 0]) == "electrician":
+            e_idx = r
+            break
+    if e_idx is None:
+        raise BackendDataError("Judul Split Ratio 'Electrician' tidak ditemukan.")
     split_electrician = (
-        _to_float(raw.iloc[current_row, 0], 0.0),
-        _to_float(raw.iloc[current_row, 1], 0.0)
+        _to_float(raw.iloc[e_idx + 1, 0], 0.0),
+        _to_float(raw.iloc[e_idx + 1, 1], 0.0)
     )
-    current_row += 1
-
 
     # --- 7. Ambil Blok 'Lost Time' ---
-    while current_row < max_rows and "lost time" not in _clean_cell_str(raw, current_row, 0):
-        current_row += 1
-        
-    if current_row >= max_rows:
-        raise BackendDataError("Judul section 'Lost Time' tidak ditemukan.")
-        
-    current_row += 2  # Lewati judul dan header kolom
-    lost_time = {}
-    while current_row < max_rows:
-        site_val = raw.iloc[current_row, 0]
-        if pd.isna(site_val) or str(site_val).strip() == "":
+    lt_idx = None
+    for r in range(max_rows):
+        if "lost time" in _clean_str(raw.iloc[r, 0]):
+            lt_idx = r
             break
-        lost_time[str(site_val).strip()] = _to_float(raw.iloc[current_row, 1])
-        current_row += 1
+    if lt_idx is None:
+        raise BackendDataError("Section 'Lost Time' tidak ditemukan.")
 
-    # Validasi Akhir Integritas Data
+    lost_time = {}
+    curr = lt_idx + 2
+    while curr < max_rows:
+        val_a = raw.iloc[curr, 0]
+        if pd.isna(val_a) or str(val_a).strip() == "":
+            break
+        lost_time[str(val_a).strip()] = _to_float(raw.iloc[curr, 1])
+        current_row = curr
+        curr += 1
+
+    # Validasi Integritas Data Akhir
     if not ratio_shift or not lost_time:
-        raise BackendDataError("Pemindaian gagal: Tabel Ratio Shift atau Lost Time terdeteksi kosong.")
+        raise BackendDataError("Tabel Ratio Shift atau Lost Time terdeteksi kosong.")
     if any(v is None for v in raci.values()):
-        raise BackendDataError(f"Nilai Proporsi RACI tidak lengkap atau gagal di-parse. Konten: {raci}")
+        raise BackendDataError(f"Nilai Proporsi RACI tidak lengkap. Hasil baca: {raci}")
 
     return BackendData(
         load_factor=lf_final,
