@@ -160,15 +160,16 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     }
 
     # 4. --- Split ratio Mechanic (M1, M2, M3) ---
-    m_title_row = _find_label_row(raw, "Mechanic", start=raci_title_row + 2, match_other_cols_empty=True)
+    # Kita matikan match_other_cols_empty karena rentan gagal jika ada karakter tersembunyi di kolom B
+    m_title_row = _find_label_row(raw, "Mechanic", start=raci_title_row + 1, match_other_cols_empty=False)
     split_mechanic = tuple(_to_float(_cell(raw, m_title_row + 1, c), 0.0) for c in range(3))
 
     # 5. --- Split ratio Welder (M1, M2) ---
-    w_title_row = _find_label_row(raw, "Welder", start=m_title_row + 1, match_other_cols_empty=True)
+    w_title_row = _find_label_row(raw, "Welder", start=m_title_row + 1, match_other_cols_empty=False)
     split_welder = tuple(_to_float(_cell(raw, w_title_row + 1, c), 0.0) for c in range(2))
 
     # 6. --- Split ratio Electrician (M1, M2) ---
-    e_title_row = _find_label_row(raw, "Electrician", start=w_title_row + 1, match_other_cols_empty=True)
+    e_title_row = _find_label_row(raw, "Electrician", start=w_title_row + 1, match_other_cols_empty=False)
     split_electrician = tuple(_to_float(_cell(raw, e_title_row + 1, c), 0.0) for c in range(2))
 
     # 7. --- Lost Time table ---
