@@ -1,13 +1,8 @@
 streamlit>=1.32
 pandas>=2.0
 requests>=2.31
-pandas
-streamlit
 google-cloud-bigquery
 db-dtypes
 matplotlib
 st-gsheets-connection
 python-pptx
-math
-logging
-os
