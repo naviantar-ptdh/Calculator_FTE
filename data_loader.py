@@ -1,10 +1,9 @@
 """
 Data loader untuk sheet BACKEND (Google Spreadsheet).
 
-Versi ini sepenuhnya dinamis dan aman dari tabrakan nama (collision-safe).
-Mencari seksi data menggunakan kecocokan teks yang fleksibel dan memastikan 
-pembacaan tabel RACI serta Split Ratio tidak saling bertabrakan walaupun 
-ada penambahan atau pengurangan baris di Google Sheets.
+Versi ini dioptimalkan khusus untuk struktur Google Sheets baru yang rapi:
+- Judul seksi dibuat unik (Proporsi RACI, Split Ratio Mechanic, dst).
+- Pembacaan data dilakukan secara dinamis berbasis pencarian string unik di Kolom A.
 """
 
 from __future__ import annotations
@@ -60,20 +59,12 @@ def _cell(df: pd.DataFrame, row: int, col: int) -> any:
     return None if pd.isna(val) else val
 
 
-def _find_row_by_label(df: pd.DataFrame, label: str, start_row: int = 0, exact_col0: bool = False) -> int:
+def _find_row_by_label(df: pd.DataFrame, label: str, start_row: int = 0) -> int:
     target = label.strip().lower()
     for r in range(start_row, len(df)):
         val0 = _clean_str(_cell(df, r, 0))
-        if exact_col0:
-            if val0 == target:
-                return r
-        else:
-            if target in val0:
-                return r
-            # Periksa kolom lain di baris tersebut jika tidak saklek di kolom 0
-            for c in range(1, len(df.columns)):
-                if target in _clean_str(_cell(df, r, c)):
-                    return r
+        if target in val0:
+            return r
     raise BackendDataError(f"Label seksi '{label}' tidak ditemukan di sheet BACKEND.")
 
 
@@ -81,7 +72,6 @@ def _read_block_until_empty(df: pd.DataFrame, start_row: int, num_cols: int) -> 
     rows = []
     r = start_row
     while r < len(df):
-        # Anggap kosong jika kolom pertama atau semua kolom yang diminta bernilai None/kosong
         all_empty = True
         row_data = []
         for c in range(num_cols):
@@ -103,7 +93,6 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
 
     # 1. --- Load Factor Block ---
     lf_title_row = _find_row_by_label(raw, "Load Factor", start_row=0)
-    # Cari baris header setelah judul (melewati baris kosong jika ada)
     header_row = lf_title_row + 1
     while header_row < len(raw) and _cell(raw, header_row, 0) is None:
         header_row += 1
@@ -125,41 +114,36 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     rs_df.columns = ["Site", "Ratio"] if not rs_df.empty else ["Site", "Ratio"]
     ratio_shift = {str(r["Site"]).strip(): _to_float(r["Ratio"]) for _, r in rs_df.iterrows()} if not rs_df.empty else {}
 
-    # 3. --- RACI Block (Horizontal Mapping) ---
-    raci_title_row = _find_row_by_label(raw, "RACI", start_row=rs_title_row)
-    raci_header = raci_title_row + 1
-    while raci_header < len(raw) and _cell(raw, raci_header, 0) is None:
-        raci_header += 1
-        
-    # Membaca horizontal: Cari nama role di baris header RACI
-    raci = {"Mechanic": None, "Electric": None, "Welder": None}
-    for c in range(len(raw.columns)):
-        col_lbl = _clean_str(_cell(raw, raci_header, c))
-        for role in raci.keys():
-            if role.lower() in col_lbl:
-                # Ambil nilai tepat di baris bawahnya
-                raci[role] = _to_float(_cell(raw, raci_header + 1, c))
+    # 3. --- RACI Block (Mencari teks unik sesuai struktur baru Anda) ---
+    raci_title_row = _find_row_by_label(raw, "Proporsi RACI", start_row=rs_title_row)
+    
+    raci = {"Mechanic": 0.0, "Electric": 0.0, "Welder": 0.0}
+    current_row = raci_title_row + 1
+    found_count = 0
+    
+    # Mencari kata kunci spesifik di bawah judul Proporsi RACI
+    while current_row < len(raw) and found_count < 3:
+        lbl = _clean_str(_cell(raw, current_row, 0))
+        if not lbl:
+            current_row += 1
+            continue
+            
+        if "raci mechanic" in lbl:
+            raci["Mechanic"] = _to_float(_cell(raw, current_row, 1))
+            found_count += 1
+        elif "raci electrician" in lbl or "raci electric" in lbl:
+            raci["Electric"] = _to_float(_cell(raw, current_row, 1))
+            found_count += 1
+        elif "raci welder" in lbl:
+            raci["Welder"] = _to_float(_cell(raw, current_row, 1))
+            found_count += 1
+            
+        current_row += 1
 
-    # 4. --- Split Ratio Blocks (Collision-Safe) ---
-    # Mulai pencarian setelah seksi RACI untuk menghindari tabrakan nama dengan header RACI
-    search_split_start = raci_header + 2
-
-    # Helper khusus mencari judul Split Ratio yang asli (Kolom B harus kosong/None untuk membedakan dari seksi lain)
-    def find_split_ratio_row(label: str, start: int) -> int:
-        target = label.lower()
-        for r in range(start, len(raw)):
-            val0 = _clean_str(_cell(raw, r, 0))
-            val1 = _cell(raw, r, 1)
-            if target in val0 and "split" in val0 and val1 is None:
-                return r
-            # Fallback jika hanya tertulis nama kuncinya saja tapi kolom B kosong
-            if val0 == target and val1 is None:
-                return r
-        # Fallback terakhir menggunakan pencarian teks biasa jika penulisan unik
-        return _find_row_by_label(raw, label, start_row=start)
-
+    # 4. --- Split Ratio Blocks (Sangat aman karena teks judul di kolom A sudah unik) ---
+    
     # Split Mechanic
-    sm_row = find_split_ratio_row("mechanic", search_split_start)
+    sm_row = _find_row_by_label(raw, "Split Ratio Mechanic", start_row=current_row)
     split_mechanic = {
         "M1": _to_float(_cell(raw, sm_row + 1, 0)),
         "M2": _to_float(_cell(raw, sm_row + 1, 1)),
@@ -167,21 +151,21 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     }
 
     # Split Welder
-    sw_row = find_split_ratio_row("welder", search_split_start)
+    sw_row = _find_row_by_label(raw, "Split Ratio Welder", start_row=sm_row + 1)
     split_welder = {
         "M1": _to_float(_cell(raw, sw_row + 1, 0)),
         "M2": _to_float(_cell(raw, sw_row + 1, 1)),
     }
 
     # Split Electrician
-    se_row = find_split_ratio_row("electrician", search_split_start)
+    se_row = _find_row_by_label(raw, "Split Ratio Electrician", start_row=sw_row + 1)
     split_electrician = {
         "M1": _to_float(_cell(raw, se_row + 1, 0)),
         "M2": _to_float(_cell(raw, se_row + 1, 1)),
     }
 
     # 5. --- Lost Time Block ---
-    lt_title_row = _find_row_by_label(raw, "Lost Time", start_row=search_split_start)
+    lt_title_row = _find_row_by_label(raw, "Lost Time", start_row=se_row + 1)
     lt_start = lt_title_row + 1
     while lt_start < len(raw) and _cell(raw, lt_start, 0) is None:
         lt_start += 1
@@ -192,8 +176,6 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     # Validasi Akhir
     if not ratio_shift or not lost_time:
         raise BackendDataError("Tabel Ratio Shift / Lost Time pada BACKEND tidak ditemukan atau kosong.")
-    if any(v is None for v in raci.values()):
-        raise BackendDataError("Proporsi data RACI horizontal pada BACKEND tidak lengkap atau tidak terbaca.")
 
     return BackendData(
         load_factor=lf_df,
