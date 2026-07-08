@@ -91,12 +91,11 @@ def _to_float(val, default=None) -> float:
 
 
 def _cell(raw: pd.DataFrame, row: int, col: int):
-    """Ambil nilai sel dengan aman; None jika di luar jangkauan atau NaN."""
+    """Ambil nilai sel dengan aman menggunakan iloc."""
     if row < 0 or row >= raw.shape[0] or col < 0 or col >= raw.shape[1]:
         return None
-    # Menggunakan .iloc lebih aman daripada .iat untuk mencegah IndexError pada koordinat batas
-    val = raw.iloc[row, col]  
-    return None if pd.isna(val) else val
+    val = raw.iloc[row, col]
+    return None if pd.isna(val) or str(val).strip() == "" else val
 
 
 def _norm(val) -> str:
@@ -105,25 +104,30 @@ def _norm(val) -> str:
 
 def _find_label_row(raw: pd.DataFrame, label: str, col: int = 0, start: int = 0,
                     match_other_cols_empty: bool = False) -> int:
-    """Cari baris pertama (mulai dari `start`) di mana raw[row, col] mengandung atau sama dengan label."""
+    """Cari baris pertama (mulai dari start) yang mengandung teks label secara case-insensitive."""
     target = label.strip().lower()
     
-    for r in range(start, len(raw)):
-        # 1. Cek kolom target utama (Kolom A / indeks 0)
-        cell_val = _cell(raw, r, col)
-        if cell_val is not None and target in str(cell_val).strip().lower():
-            if match_other_cols_empty and _cell(raw, r, col + 1) is not None:
-                continue
+    for r in range(start, raw.shape[0]):
+        # Ambil nilai sel di kolom utama dengan aman
+        val_main = raw.iloc[r, col] if col < raw.shape[1] else None
+        if pd.notna(val_main) and target in str(val_main).strip().lower():
+            if match_other_cols_empty:
+                # Pastikan kolom sebelahnya kosong (untuk membedakan judul section dengan header)
+                val_next = raw.iloc[r, col + 1] if (col + 1) < raw.shape[1] else None
+                if pd.notna(val_next) and str(val_next).strip() != "":
+                    continue
             return r
             
-        # 2. ANTISIPASI: Cek kolom sebelah kanan (Kolom B / indeks 1) 
-        # Jika teks tidak sengaja bergeser akibat merger sel di Google Sheets
-        cell_val_backup = _cell(raw, r, col + 1)
-        if col == 0 and cell_val_backup is not None and target in str(cell_val_backup).strip().lower():
-            if match_other_cols_empty and _cell(raw, r, col + 2) is not None:
-                continue
-            return r
-            
+        # Pengecekan cadangan di kolom B (indeks 1) jika kolom A di-merge
+        if col == 0 and raw.shape[1] > 1:
+            val_sub = raw.iloc[r, 1]
+            if pd.notna(val_sub) and target in str(val_sub).strip().lower():
+                if match_other_cols_empty:
+                    val_next = raw.iloc[r, 2] if raw.shape[1] > 2 else None
+                    if pd.notna(val_next) and str(val_next).strip() != "":
+                        continue
+                return r
+                
     raise BackendDataError(
         f"Section '{label}' tidak ditemukan pada sheet BACKEND. "
         f"Pastikan label section ini masih ada di kolom A atau B."
@@ -131,14 +135,14 @@ def _find_label_row(raw: pd.DataFrame, label: str, col: int = 0, start: int = 0,
 
 
 def _read_block(raw: pd.DataFrame, start_row: int, ncols: int) -> pd.DataFrame:
-    """Baca baris-baris berurutan mulai `start_row` selama baris tersebut tidak sepenuhnya kosong."""
+    """Baca baris berurutan mulai dari start_row hingga menemukan baris yang benar-benar kosong."""
     rows = []
     r = start_row
-    while r < len(raw):
+    while r < raw.shape[0]:
         row_data = [_cell(raw, r, c) for c in range(ncols)]
         
-        # Berhenti HANYA JIKA kolom pertama kosong DAN seluruh kolom di baris tersebut juga kosong (artinya pembatas tabel asli)
-        if row_data[0] is None and all(x is None for x in row_data):
+        # Jika semua kolom yang diminta di baris ini kosong (None), artinya tabel sudah selesai
+        if all(x is None for x in row_data):
             break
             
         rows.append(row_data)
