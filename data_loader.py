@@ -3,17 +3,14 @@
 Robust BACKEND CSV loader + parser for Calculator_FTE.
 
 Provides:
- - BackendData dataclass
+ - BackendData dataclass (includes .sites list)
  - BackendDataError exception
  - load_backend_data(source=None)  -> BackendData
  - parse_backend(raw: pd.DataFrame) -> BackendData
 
-load_backend_data accepts:
- - None (will try env vars / default file / Google Sheets export)
- - str (file path or URL)
- - pandas.DataFrame (already loaded)
-
-If you call load_backend_data() with no args (as in your app), it will attempt sensible fallbacks.
+Compatibility:
+ - load_backend_data() can be called with no args (app behavior).
+ - BackendData has attribute `sites` (list of site names) to match app.py usage.
 """
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -39,6 +36,10 @@ class BackendData:
     split_welder: List[float]
     split_electrician: List[float]
     lost_time: Dict[str, float]
+    sites: List[str]
+
+    def first_site(self) -> Optional[str]:
+        return self.sites[0] if self.sites else None
 
 
 # -----------------------
@@ -124,249 +125,254 @@ def _find_first_row_matching_any(rows_text: List[str], keywords: List[str], star
 def parse_backend(raw: pd.DataFrame) -> BackendData:
     """
     Parse the BACKEND CSV (loaded into DataFrame raw, header=None or arbitrary).
-    Returns BackendData with parsed pieces.
+    Returns BackendData with parsed pieces and computed .sites list.
     """
-    try:
-        df = raw.copy().reset_index(drop=True)
-        rows_text = [_row_to_text(df.iloc[i]) for i in range(len(df))]
-        blank_mask = [_is_blank_row(df.iloc[i]) for i in range(len(df))]
+    df = raw.copy().reset_index(drop=True)
+    rows_text = [_row_to_text(df.iloc[i]) for i in range(len(df))]
+    blank_mask = [_is_blank_row(df.iloc[i]) for i in range(len(df))]
 
-        # 1) Load Factor
-        lf_header_idx = _find_first_row_containing(rows_text, "sub category")
-        if lf_header_idx is None:
-            load_factor_title_idx = _find_first_row_containing(rows_text, "load factor")
-            if load_factor_title_idx is not None:
-                j = load_factor_title_idx + 1
-                while j < len(df) and blank_mask[j]:
-                    j += 1
-                lf_header_idx = j if j < len(df) else None
-        if lf_header_idx is None:
-            lf_header_idx = _find_first_row_matching_any(rows_text, ["load mechanic", "load electrician", "load welder"], start=0)
-
-        lf_end_idx = None
-        if lf_header_idx is not None:
-            j = lf_header_idx + 1
-            while j < len(df) and not blank_mask[j]:
-                if "Ratio Shift" in rows_text[j]:
-                    break
-                j += 1
-            lf_end_idx = j
-
-        if lf_header_idx is not None and lf_end_idx is not None and lf_end_idx > lf_header_idx:
-            header_row = df.iloc[lf_header_idx].astype(str).tolist()
-            col_names = [str(c).strip() for c in header_row]
-            lf_rows = df.iloc[lf_header_idx + 1:lf_end_idx].copy()
-            if lf_rows.shape[1] != len(col_names):
-                col_names = [f"col_{i}" for i in range(lf_rows.shape[1])]
-            lf_rows.columns = col_names
-            lf_rows.columns = [c if str(c).strip() != "" else f"col_{i}" for i, c in enumerate(lf_rows.columns)]
-            lf_df = lf_rows.copy()
-            for col in lf_df.columns:
-                lf_df[col] = lf_df[col].apply(lambda v: (_safe_float(v) if isinstance(v, str) or pd.isna(v) else (float(v) if not pd.isna(v) else math.nan)))
-        else:
-            lf_df = pd.DataFrame()
-            logger.warning("Load Factor block not found or empty")
-
-        # 2) Ratio Shift
-        ratio_shift = {}
-        rs_title_idx = _find_first_row_containing(rows_text, "ratio shift")
-        if rs_title_idx is not None:
-            j = rs_title_idx + 1
+    # 1) Load Factor
+    lf_header_idx = _find_first_row_containing(rows_text, "sub category")
+    if lf_header_idx is None:
+        load_factor_title_idx = _find_first_row_containing(rows_text, "load factor")
+        if load_factor_title_idx is not None:
+            j = load_factor_title_idx + 1
             while j < len(df) and blank_mask[j]:
                 j += 1
-            if j < len(df):
-                if "site" in rows_text[j] or "ratio" in rows_text[j]:
-                    rs_header_idx = j
-                    j2 = rs_header_idx + 1
-                    while j2 < len(df) and not blank_mask[j2]:
-                        if "proporsi raci" in rows_text[j2] or rows_text[j2].strip().startswith("proporsi") or "raci" in rows_text[j2]:
-                            break
-                        row_cells = df.iloc[j2].tolist()
-                        site = None
-                        val = None
-                        if len(row_cells) >= 1 and not pd.isna(row_cells[0]) and str(row_cells[0]).strip() != "":
-                            site = str(row_cells[0]).strip()
-                        if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
-                            val = _safe_float(row_cells[1])
-                        if site:
-                            ratio_shift[site] = val if val is not None else math.nan
-                        j2 += 1
-        else:
-            logger.debug("Ratio Shift title not found")
+            lf_header_idx = j if j < len(df) else None
+    if lf_header_idx is None:
+        lf_header_idx = _find_first_row_matching_any(rows_text, ["load mechanic", "load electrician", "load welder"], start=0)
 
-        # 3) RACI
-        raci = {}
-        raci_title_idx = _find_first_row_containing(rows_text, "proporsi raci")
-        if raci_title_idx is None:
-            raci_title_idx = _find_first_row_containing(rows_text, "raci")
-        raci_table_end_idx = raci_title_idx
-        if raci_title_idx is not None:
-            j = raci_title_idx + 1
-            while j < len(df) and not blank_mask[j]:
-                txt = rows_text[j]
-                roles = ["mechanic", "electric", "welder", "electrician"]
-                found_role = None
-                for r in roles:
-                    if r in txt:
-                        found_role = r
+    lf_end_idx = None
+    if lf_header_idx is not None:
+        j = lf_header_idx + 1
+        while j < len(df) and not blank_mask[j]:
+            if "ratio shift" in rows_text[j]:
+                break
+            j += 1
+        lf_end_idx = j
+
+    if lf_header_idx is not None and lf_end_idx is not None and lf_end_idx > lf_header_idx:
+        header_row = df.iloc[lf_header_idx].astype(str).tolist()
+        col_names = [str(c).strip() for c in header_row]
+        lf_rows = df.iloc[lf_header_idx + 1:lf_end_idx].copy()
+        if lf_rows.shape[1] != len(col_names):
+            col_names = [f"col_{i}" for i in range(lf_rows.shape[1])]
+        lf_rows.columns = col_names
+        lf_rows.columns = [c if str(c).strip() != "" else f"col_{i}" for i, c in enumerate(lf_rows.columns)]
+        lf_df = lf_rows.copy()
+        for col in lf_df.columns:
+            lf_df[col] = lf_df[col].apply(lambda v: (_safe_float(v) if isinstance(v, str) or pd.isna(v) else (float(v) if not pd.isna(v) else math.nan)))
+    else:
+        lf_df = pd.DataFrame()
+        logger.warning("Load Factor block not found or empty")
+
+    # 2) Ratio Shift
+    ratio_shift = {}
+    rs_title_idx = _find_first_row_containing(rows_text, "ratio shift")
+    if rs_title_idx is not None:
+        j = rs_title_idx + 1
+        while j < len(df) and blank_mask[j]:
+            j += 1
+        if j < len(df):
+            if "site" in rows_text[j] or "ratio" in rows_text[j]:
+                rs_header_idx = j
+                j2 = rs_header_idx + 1
+                while j2 < len(df) and not blank_mask[j2]:
+                    if "proporsi raci" in rows_text[j2] or rows_text[j2].strip().startswith("proporsi") or "raci" in rows_text[j2]:
                         break
-                row_cells = df.iloc[j].tolist()
-                val = None
-                if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
-                    val = _parse_percent_cell(row_cells[1])
-                elif found_role:
-                    for c in row_cells[1:]:
-                        if not pd.isna(c) and str(c).strip() != "":
-                            maybe = _parse_percent_cell(c)
-                            if not math.isnan(maybe):
-                                val = maybe
-                                break
-                if found_role:
-                    name = "electrician" if found_role in ("electric", "electrician") else found_role
-                    raci[name] = val if val is not None else math.nan
-                j += 1
-            raci_table_end_idx = j
-        else:
-            logger.debug("RACI block not found")
+                    row_cells = df.iloc[j2].tolist()
+                    site = None
+                    val = None
+                    if len(row_cells) >= 1 and not pd.isna(row_cells[0]) and str(row_cells[0]).strip() != "":
+                        site = str(row_cells[0]).strip()
+                    if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
+                        val = _safe_float(row_cells[1])
+                    if site:
+                        ratio_shift[site] = val if val is not None else math.nan
+                    j2 += 1
+    else:
+        logger.debug("Ratio Shift title not found")
 
-        # 4) Split Ratios (search after raci_table_end_idx to avoid collisions)
-        def _extract_split_after(role_keyword: str, after_idx: int) -> List[float]:
-            target = None
+    # 3) RACI
+    raci = {}
+    raci_title_idx = _find_first_row_containing(rows_text, "proporsi raci")
+    if raci_title_idx is None:
+        raci_title_idx = _find_first_row_containing(rows_text, "raci")
+    raci_table_end_idx = raci_title_idx
+    if raci_title_idx is not None:
+        j = raci_title_idx + 1
+        while j < len(df) and not blank_mask[j]:
+            txt = rows_text[j]
+            roles = ["mechanic", "electric", "welder", "electrician"]
+            found_role = None
+            for r in roles:
+                if r in txt:
+                    found_role = r
+                    break
+            row_cells = df.iloc[j].tolist()
+            val = None
+            if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
+                val = _parse_percent_cell(row_cells[1])
+            elif found_role:
+                for c in row_cells[1:]:
+                    if not pd.isna(c) and str(c).strip() != "":
+                        maybe = _parse_percent_cell(c)
+                        if not math.isnan(maybe):
+                            val = maybe
+                            break
+            if found_role:
+                name = "electrician" if found_role in ("electric", "electrician") else found_role
+                raci[name] = val if val is not None else math.nan
+            j += 1
+        raci_table_end_idx = j
+    else:
+        logger.debug("RACI block not found")
+
+    # 4) Split Ratios (search after raci_table_end_idx to avoid collisions)
+    def _extract_split_after(role_keyword: str, after_idx: int) -> List[float]:
+        target = None
+        for i in range(after_idx + 1, len(df)):
+            rt = rows_text[i]
+            if ("split ratio" in rt and role_keyword in rt) or (f"split ratio {role_keyword}" in rt):
+                target = i
+                break
+        if target is None:
             for i in range(after_idx + 1, len(df)):
                 rt = rows_text[i]
-                if ("split ratio" in rt and role_keyword in rt) or (f"split ratio {role_keyword}" in rt):
+                if role_keyword in rt and "split" in rt:
                     target = i
                     break
-            if target is None:
-                for i in range(after_idx + 1, len(df)):
-                    rt = rows_text[i]
-                    if role_keyword in rt and "split" in rt:
-                        target = i
-                        break
-            if target is None:
-                for i in range(after_idx + 1, len(df)):
-                    first_cell = str(df.iloc[i, 0]) if df.shape[1] >= 1 else ""
-                    if first_cell.strip().lower() == role_keyword:
-                        target = i
-                        break
-            if target is None:
-                logger.debug("Split ratio header for %s not found after row %s", role_keyword, after_idx)
-                return []
+        if target is None:
+            for i in range(after_idx + 1, len(df)):
+                first_cell = str(df.iloc[i, 0]) if df.shape[1] >= 1 else ""
+                if first_cell.strip().lower() == role_keyword:
+                    target = i
+                    break
+        if target is None:
+            logger.debug("Split ratio header for %s not found after row %s", role_keyword, after_idx)
+            return []
 
-            results = []
-            j = target + 1
-            while j < len(df) and not blank_mask[j]:
-                row0 = str(df.iloc[j, 0]).strip().lower() if df.shape[1] >= 1 else ""
-                if row0.startswith("m") or "%" in rows_text[j] or any(ch.isdigit() for ch in rows_text[j]):
-                    row_cells = df.iloc[j].tolist()
-                    numeric_found = False
-                    for c in row_cells[1:]:
+        results = []
+        j = target + 1
+        while j < len(df) and not blank_mask[j]:
+            row0 = str(df.iloc[j, 0]).strip().lower() if df.shape[1] >= 1 else ""
+            if row0.startswith("m") or "%" in rows_text[j] or any(ch.isdigit() for ch in rows_text[j]):
+                row_cells = df.iloc[j].tolist()
+                numeric_found = False
+                for c in row_cells[1:]:
+                    if pd.isna(c):
+                        continue
+                    s = str(c).strip()
+                    if s == "":
+                        continue
+                    v = _parse_percent_cell(s)
+                    if math.isnan(v):
+                        v = _safe_float(s)
+                        if math.isnan(v):
+                            continue
+                    results.append(v)
+                    numeric_found = True
+                if not numeric_found:
+                    for c in row_cells:
                         if pd.isna(c):
                             continue
                         s = str(c).strip()
                         if s == "":
                             continue
                         v = _parse_percent_cell(s)
-                        if math.isnan(v):
-                            v = _safe_float(s)
-                            if math.isnan(v):
-                                continue
-                        results.append(v)
-                        numeric_found = True
-                    if not numeric_found:
-                        for c in row_cells:
-                            if pd.isna(c):
-                                continue
-                            s = str(c).strip()
-                            if s == "":
-                                continue
-                            v = _parse_percent_cell(s)
-                            if not math.isnan(v):
-                                results.append(v)
+                        if not math.isnan(v):
+                            results.append(v)
+                            numeric_found = True
+                        else:
+                            v2 = _safe_float(s)
+                            if not math.isnan(v2):
+                                results.append(v2)
                                 numeric_found = True
-                            else:
-                                v2 = _safe_float(s)
-                                if not math.isnan(v2):
-                                    results.append(v2)
-                                    numeric_found = True
-                    j += 1
-                    continue
-                else:
-                    break
-            if len(results) == 0:
-                return []
-            normed = []
-            for v in results:
-                if math.isnan(v):
-                    normed.append(math.nan)
-                elif v > 1.0:
-                    normed.append(v / 100.0)
-                else:
-                    normed.append(v)
-            seen = set()
-            dedup = []
-            for v in normed:
-                if math.isnan(v):
-                    if "nan" in seen:
-                        continue
-                    seen.add("nan")
-                    dedup.append(v)
-                else:
-                    if v in seen:
-                        continue
-                    seen.add(v)
-                    dedup.append(v)
-            return dedup
-
-        after_raci_idx = raci_table_end_idx if raci_table_end_idx is not None else 0
-        split_mechanic = _extract_split_after("mechanic", after_raci_idx)
-        split_welder = _extract_split_after("welder", after_raci_idx)
-        split_electrician = _extract_split_after("electrician", after_raci_idx)
-        if not split_electrician:
-            split_electrician = _extract_split_after("electric", after_raci_idx)
-
-        # 5) Lost Time
-        lost_time = {}
-        lt_title_idx = _find_first_row_containing(rows_text, "lost time")
-        if lt_title_idx is not None:
-            j = lt_title_idx + 1
-            while j < len(df) and blank_mask[j]:
                 j += 1
-            if j < len(df) and ("site" in rows_text[j] or "lost time" in rows_text[j]):
-                start_parse = j + 1
+                continue
             else:
-                start_parse = j
-            k = start_parse
-            while k < len(df) and not blank_mask[k]:
-                row_cells = df.iloc[k].tolist()
-                site = None
-                val = None
-                if len(row_cells) >= 1 and not pd.isna(row_cells[0]) and str(row_cells[0]).strip() != "":
-                    site = str(row_cells[0]).strip()
-                if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
-                    val = _safe_float(row_cells[1])
-                if site:
-                    lost_time[site] = val if val is not None else math.nan
-                k += 1
+                break
+        if len(results) == 0:
+            return []
+        normed = []
+        for v in results:
+            if math.isnan(v):
+                normed.append(math.nan)
+            elif v > 1.0:
+                normed.append(v / 100.0)
+            else:
+                normed.append(v)
+        seen = set()
+        dedup = []
+        for v in normed:
+            if math.isnan(v):
+                if "nan" in seen:
+                    continue
+                seen.add("nan")
+                dedup.append(v)
+            else:
+                if v in seen:
+                    continue
+                seen.add(v)
+                dedup.append(v)
+        return dedup
+
+    after_raci_idx = raci_table_end_idx if raci_table_end_idx is not None else 0
+    split_mechanic = _extract_split_after("mechanic", after_raci_idx)
+    split_welder = _extract_split_after("welder", after_raci_idx)
+    split_electrician = _extract_split_after("electrician", after_raci_idx)
+    if not split_electrician:
+        split_electrician = _extract_split_after("electric", after_raci_idx)
+
+    # 5) Lost Time
+    lost_time = {}
+    lt_title_idx = _find_first_row_containing(rows_text, "lost time")
+    if lt_title_idx is not None:
+        j = lt_title_idx + 1
+        while j < len(df) and blank_mask[j]:
+            j += 1
+        if j < len(df) and ("site" in rows_text[j] or "lost time" in rows_text[j]):
+            start_parse = j + 1
         else:
-            logger.debug("Lost Time block not present")
+            start_parse = j
+        k = start_parse
+        while k < len(df) and not blank_mask[k]:
+            row_cells = df.iloc[k].tolist()
+            site = None
+            val = None
+            if len(row_cells) >= 1 and not pd.isna(row_cells[0]) and str(row_cells[0]).strip() != "":
+                site = str(row_cells[0]).strip()
+            if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
+                val = _safe_float(row_cells[1])
+            if site:
+                lost_time[site] = val if val is not None else math.nan
+            k += 1
+    else:
+        logger.debug("Lost Time block not present")
 
-        for k in ("mechanic", "electrician", "welder"):
-            if k not in raci:
-                raci[k] = math.nan
+    # Ensure raci keys exist
+    for k in ("mechanic", "electrician", "welder"):
+        if k not in raci:
+            raci[k] = math.nan
 
-        return BackendData(
-            load_factor=lf_df,
-            ratio_shift=ratio_shift,
-            raci=raci,
-            split_mechanic=split_mechanic,
-            split_welder=split_welder,
-            split_electrician=split_electrician,
-            lost_time=lost_time,
-        )
-    except Exception as e:
-        logger.exception("Failed to parse backend data")
-        raise BackendDataError("Failed to parse backend data") from e
+    # Compute sites list: prefer ratio_shift keys (preserve insertion order), fallback to lost_time keys
+    sites = list(ratio_shift.keys()) if ratio_shift else list(lost_time.keys())
+    # If still empty, try to infer from load_factor (not typical) - no-op otherwise
+    if not sites and not lf_df.empty:
+        # attempt to find any header-like site columns - fallback to empty
+        sites = []
+
+    return BackendData(
+        load_factor=lf_df,
+        ratio_shift=ratio_shift,
+        raci=raci,
+        split_mechanic=split_mechanic,
+        split_welder=split_welder,
+        split_electrician=split_electrician,
+        lost_time=lost_time,
+        sites=sites,
+    )
 
 
 # -----------------------
@@ -378,7 +384,7 @@ def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> Back
      - pandas.DataFrame (if provided)
      - str path or URL (if provided)
      - None: try env var BACKEND_CSV_PATH, then BACKEND_CSV_URL, then default file name,
-             then Google Sheets export URL (uses sheet id/gid known from your message).
+             then Google Sheets export URL (sheet id/gid from your message).
 
     Returns BackendData or raises BackendDataError.
     """
@@ -392,14 +398,12 @@ def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> Back
             raw = source
             return parse_backend(raw)
 
-        # if a path/url provided
         if isinstance(source, str):
             src = source.strip()
             try:
                 raw = pd.read_csv(src, header=None, dtype=str)
             except Exception as e:
                 logger.debug("Failed reading source %r via pandas: %s", src, e)
-                # try read via requests if URL and pandas failed (optional)
                 raise BackendDataError(f"Failed to read CSV from {src}") from e
             return parse_backend(raw)
 
@@ -412,7 +416,6 @@ def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> Back
             except Exception as e:
                 logger.warning("Failed to read BACKEND_CSV_PATH=%r: %s", env_path, e)
 
-        # env var URL
         env_url = os.getenv("BACKEND_CSV_URL")
         if env_url:
             try:
@@ -421,7 +424,6 @@ def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> Back
             except Exception as e:
                 logger.warning("Failed to read BACKEND_CSV_URL=%r: %s", env_url, e)
 
-        # default local filename
         default_fname = "FTE - BACKEND (2).csv"
         if os.path.exists(default_fname):
             try:
@@ -430,14 +432,12 @@ def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> Back
             except Exception as e:
                 logger.warning("Failed to read default CSV %r: %s", default_fname, e)
 
-        # final fallback: attempt direct Google Sheets export URL
         try:
             raw = pd.read_csv(google_export_url, header=None, dtype=str)
             return parse_backend(raw)
         except Exception as e:
             logger.exception("Failed to fetch Google Sheets export CSV from %s", google_export_url)
 
-        # nothing worked
         raise BackendDataError(
             "Could not load BACKEND CSV: tried BACKEND_CSV_PATH, BACKEND_CSV_URL, "
             f"default file {default_fname}, and Google Sheets export URL."
