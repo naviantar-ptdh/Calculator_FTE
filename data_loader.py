@@ -1,6 +1,10 @@
 """
 Data loader untuk sheet BACKEND (Google Spreadsheet).
-Versi Finetuned: Pemindaian dinamis berbasis teks, bebas dari hardcoded row index.
+
+Versi ini sepenuhnya dinamis dan aman dari tabrakan nama (collision-safe).
+Mencari seksi data menggunakan kecocokan teks yang fleksibel dan memastikan 
+pembacaan tabel RACI serta Split Ratio tidak saling bertabrakan walaupun 
+ada penambahan atau pengurangan baris di Google Sheets.
 """
 
 from __future__ import annotations
@@ -20,194 +24,179 @@ class BackendDataError(RuntimeError):
 
 @dataclass
 class BackendData:
-    load_factor: pd.DataFrame          # index: Sub Category
+    load_factor: pd.DataFrame          # index: Sub Category, kolom: Attribute, Load Mechanic, Load Electrican, Load Welder
     ratio_shift: dict                  # {site: ratio}
     lost_time: dict                    # {site: lost_time}
-    raci: dict                         # {"Mechanic":.., "Electric":.., "Welder":..}
-    split_mechanic: tuple              # (m1, m2, m3)
-    split_welder: tuple                # (m1, m2)
-    split_electrician: tuple           # (m1, m2)
-
-    @property
-    def sub_categories(self) -> list:
-        return list(self.load_factor.index)
-
-    def units_for(self, sub_category: str) -> list:
-        if sub_category not in self.load_factor.index:
-            return []
-        val = self.load_factor.loc[sub_category, "Attribute"]
-        return [val] if pd.notna(val) else []
-
-    @property
-    def sites(self) -> list:
-        return sorted(set(self.ratio_shift) & set(self.lost_time))
+    raci: dict                         # {role: proporsi}
+    split_mechanic: dict               # {M1: x, M2: y, M3: z}
+    split_welder: dict                 # {M1: x, M2: y}
+    split_electrician: dict            # {M1: x, M2: y}
 
 
-def _fetch_raw_csv(sheet_name: str = BACKEND_SHEET_NAME, spreadsheet_id: str = SPREADSHEET_ID) -> pd.DataFrame:
-    url = gsheet_csv_url(sheet_name, spreadsheet_id)
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise BackendDataError(
-            f"Gagal mengambil data dari Google Sheets ({sheet_name}). "
-            f"Detail: {exc}"
-        ) from exc
-
-    try:
-        df = pd.read_csv(io.StringIO(resp.text), header=None)
-        df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
-    except Exception as exc:
-        raise BackendDataError(f"Gagal parsing CSV dari sheet {sheet_name}: {exc}") from exc
-
-    if df.empty:
-        raise BackendDataError(f"Sheet {sheet_name} kosong atau tidak ditemukan.")
-    return df
-
-
-def _to_float(val, default=None) -> float:
-    if pd.isna(val) or str(val).strip() == "":
-        return default
-    if isinstance(val, str):
-        val = val.strip().replace(",", ".")
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return default
-
-
-def _clean_str(val) -> str:
+def _clean_str(val: any) -> str:
     if pd.isna(val):
         return ""
     return str(val).strip().lower()
 
 
+def _to_float(val: any, default: float = 0.0) -> float:
+    if pd.isna(val):
+        return default
+    s = str(val).strip().replace(",", ".")
+    if not s:
+        return default
+    try:
+        return float(s)
+    except ValueError:
+        return default
+
+
+def _cell(df: pd.DataFrame, row: int, col: int) -> any:
+    if row < 0 or row >= len(df):
+        return None
+    if col < 0 or col >= len(df.columns):
+        return None
+    val = df.iloc[row, col]
+    return None if pd.isna(val) else val
+
+
+def _find_row_by_label(df: pd.DataFrame, label: str, start_row: int = 0, exact_col0: bool = False) -> int:
+    target = label.strip().lower()
+    for r in range(start_row, len(df)):
+        val0 = _clean_str(_cell(df, r, 0))
+        if exact_col0:
+            if val0 == target:
+                return r
+        else:
+            if target in val0:
+                return r
+            # Periksa kolom lain di baris tersebut jika tidak saklek di kolom 0
+            for c in range(1, len(df.columns)):
+                if target in _clean_str(_cell(df, r, c)):
+                    return r
+    raise BackendDataError(f"Label seksi '{label}' tidak ditemukan di sheet BACKEND.")
+
+
+def _read_block_until_empty(df: pd.DataFrame, start_row: int, num_cols: int) -> pd.DataFrame:
+    rows = []
+    r = start_row
+    while r < len(df):
+        # Anggap kosong jika kolom pertama atau semua kolom yang diminta bernilai None/kosong
+        all_empty = True
+        row_data = []
+        for c in range(num_cols):
+            val = _cell(df, r, c)
+            row_data.append(val)
+            if val is not None and str(val).strip() != "":
+                all_empty = False
+        
+        if all_empty:
+            break
+        rows.append(row_data)
+        r += 1
+    return pd.DataFrame(rows)
+
+
 def parse_backend(raw: pd.DataFrame) -> BackendData:
-    max_rows = raw.shape[0]
+    if raw.empty:
+        raise BackendDataError("Data mentah dari Google Sheets kosong.")
 
-    # --- 1. Ambil Blok 'Load Factor' ---
-    lf_idx = None
-    for r in range(max_rows):
-        if "load factor" in _clean_str(raw.iloc[r, 0]):
-            lf_idx = r
-            break
-    if lf_idx is None:
-        raise BackendDataError("Section 'Load Factor' tidak ditemukan di kolom A.")
+    # 1. --- Load Factor Block ---
+    lf_title_row = _find_row_by_label(raw, "Load Factor", start_row=0)
+    # Cari baris header setelah judul (melewati baris kosong jika ada)
+    header_row = lf_title_row + 1
+    while header_row < len(raw) and _cell(raw, header_row, 0) is None:
+        header_row += 1
+        
+    lf_df = _read_block_until_empty(raw, header_row + 1, 5)
+    if lf_df.empty:
+        raise BackendDataError("Tabel Load Factor tidak ditemukan atau kosong.")
+        
+    lf_df.columns = ["Sub Category", "Attribute", "Load Mechanic", "Load Electrican", "Load Welder"]
+    lf_df["Sub Category"] = lf_df["Sub Category"].astype(str).str.strip()
+    lf_df = lf_df.dropna(subset=["Sub Category"]).set_index("Sub Category")
 
-    lf_rows_list = []
-    curr = lf_idx + 2
-    while curr < max_rows:
-        val_a = raw.iloc[curr, 0]
-        if pd.isna(val_a) or str(val_a).strip() == "" or "ratio shift" in _clean_str(val_a):
-            break
-        lf_rows_list.append([
-            str(val_a).strip(),
-            raw.iloc[curr, 1],
-            _to_float(raw.iloc[curr, 2]),
-            _to_float(raw.iloc[curr, 3]),
-            _to_float(raw.iloc[curr, 4])
-        ])
-        curr += 1
-    
-    lf_df = pd.DataFrame(lf_rows_list, columns=["Sub Category", "Attribute", "Load Mechanic", "Load Electrican", "Load Welder"])
-    lf_final = lf_df.dropna(subset=["Sub Category"]).set_index("Sub Category")
+    # 2. --- Ratio Shift Block ---
+    rs_title_row = _find_row_by_label(raw, "Ratio Shift", start_row=header_row)
+    rs_start = rs_title_row + 1
+    while rs_start < len(raw) and _cell(raw, rs_start, 0) is None:
+        rs_start += 1
+    rs_df = _read_block_until_empty(raw, rs_start, 2)
+    rs_df.columns = ["Site", "Ratio"] if not rs_df.empty else ["Site", "Ratio"]
+    ratio_shift = {str(r["Site"]).strip(): _to_float(r["Ratio"]) for _, r in rs_df.iterrows()} if not rs_df.empty else {}
 
-    # --- 2. Ambil Blok 'Ratio Shift' ---
-    rs_idx = None
-    for r in range(max_rows):
-        if "ratio shift" in _clean_str(raw.iloc[r, 0]):
-            rs_idx = r
-            break
-    if rs_idx is None:
-        raise BackendDataError("Section 'Ratio Shift' tidak ditemukan di kolom A.")
+    # 3. --- RACI Block (Horizontal Mapping) ---
+    raci_title_row = _find_row_by_label(raw, "RACI", start_row=rs_title_row)
+    raci_header = raci_title_row + 1
+    while raci_header < len(raw) and _cell(raw, raci_header, 0) is None:
+        raci_header += 1
+        
+    # Membaca horizontal: Cari nama role di baris header RACI
+    raci = {"Mechanic": None, "Electric": None, "Welder": None}
+    for c in range(len(raw.columns)):
+        col_lbl = _clean_str(_cell(raw, raci_header, c))
+        for role in raci.keys():
+            if role.lower() in col_lbl:
+                # Ambil nilai tepat di baris bawahnya
+                raci[role] = _to_float(_cell(raw, raci_header + 1, c))
 
-    ratio_shift = {}
-    curr = rs_idx + 2
-    while curr < max_rows:
-        val_a = raw.iloc[curr, 0]
-        if pd.isna(val_a) or str(val_a).strip() == "" or "raci" in _clean_str(val_a):
-            break
-        ratio_shift[str(val_a).strip()] = _to_float(raw.iloc[curr, 1])
-        curr += 1
+    # 4. --- Split Ratio Blocks (Collision-Safe) ---
+    # Mulai pencarian setelah seksi RACI untuk menghindari tabrakan nama dengan header RACI
+    search_split_start = raci_header + 2
 
-    # --- 3. Ambil Blok 'RACI' ---
-    raci_idx = None
-    for r in range(max_rows):
-        if _clean_str(raw.iloc[r, 0]) == "raci":
-            raci_idx = r
-            break
-    if raci_idx is None:
-        raise BackendDataError("Section 'RACI' tidak ditemukan di kolom A.")
+    # Helper khusus mencari judul Split Ratio yang asli (Kolom B harus kosong/None untuk membedakan dari seksi lain)
+    def find_split_ratio_row(label: str, start: int) -> int:
+        target = label.lower()
+        for r in range(start, len(raw)):
+            val0 = _clean_str(_cell(raw, r, 0))
+            val1 = _cell(raw, r, 1)
+            if target in val0 and "split" in val0 and val1 is None:
+                return r
+            # Fallback jika hanya tertulis nama kuncinya saja tapi kolom B kosong
+            if val0 == target and val1 is None:
+                return r
+        # Fallback terakhir menggunakan pencarian teks biasa jika penulisan unik
+        return _find_row_by_label(raw, label, start_row=start)
 
-    raci = {
-        "Mechanic": _to_float(raw.iloc[raci_idx + 1, 1]),
-        "Electric": _to_float(raw.iloc[raci_idx + 2, 1]),
-        "Welder": _to_float(raw.iloc[raci_idx + 3, 1])
+    # Split Mechanic
+    sm_row = find_split_ratio_row("mechanic", search_split_start)
+    split_mechanic = {
+        "M1": _to_float(_cell(raw, sm_row + 1, 0)),
+        "M2": _to_float(_cell(raw, sm_row + 1, 1)),
+        "M3": _to_float(_cell(raw, sm_row + 1, 2)),
     }
 
-    # Pembatasan area deteksi split ratio agar tidak tabrakan dengan teks vertikal RACI
-    split_search_start = raci_idx + 4
+    # Split Welder
+    sw_row = find_split_ratio_row("welder", search_split_start)
+    split_welder = {
+        "M1": _to_float(_cell(raw, sw_row + 1, 0)),
+        "M2": _to_float(_cell(raw, sw_row + 1, 1)),
+    }
 
-    # --- 4. Ambil Blok 'Split Ratio Mechanic' ---
-    m_idx = None
-    for r in range(split_search_start, max_rows):
-        if _clean_str(raw.iloc[r, 0]) == "mechanic":
-            m_idx = r
-            break
-    if m_idx is None:
-        raise BackendDataError("Judul Split Ratio 'Mechanic' tidak ditemukan setelah tabel RACI.")
-    split_mechanic = (
-        _to_float(raw.iloc[m_idx + 1, 0], 0.0),
-        _to_float(raw.iloc[m_idx + 1, 1], 0.0),
-        _to_float(raw.iloc[m_idx + 1, 2], 0.0)
-    )
+    # Split Electrician
+    se_row = find_split_ratio_row("electrician", search_split_start)
+    split_electrician = {
+        "M1": _to_float(_cell(raw, se_row + 1, 0)),
+        "M2": _to_float(_cell(raw, se_row + 1, 1)),
+    }
 
-    # --- 5. Ambil Blok 'Split Ratio Welder' ---
-    w_idx = None
-    for r in range(m_idx + 2, max_rows):
-        if _clean_str(raw.iloc[r, 0]) == "welder":
-            w_idx = r
-            break
-    if w_idx is None:
-        raise BackendDataError("Judul Split Ratio 'Welder' tidak ditemukan.")
-    split_welder = (
-        _to_float(raw.iloc[w_idx + 1, 0], 0.0),
-        _to_float(raw.iloc[w_idx + 1, 1], 0.0)
-    )
+    # 5. --- Lost Time Block ---
+    lt_title_row = _find_row_by_label(raw, "Lost Time", start_row=search_split_start)
+    lt_start = lt_title_row + 1
+    while lt_start < len(raw) and _cell(raw, lt_start, 0) is None:
+        lt_start += 1
+    lt_df = _read_block_until_empty(raw, lt_start, 2)
+    lt_df.columns = ["Site", "Lost Time"] if not lt_df.empty else ["Site", "Lost Time"]
+    lost_time = {str(r["Site"]).strip(): _to_float(r["Lost Time"]) for _, r in lt_df.iterrows()} if not lt_df.empty else {}
 
-    # --- 6. Ambil Blok 'Split Ratio Electrician' ---
-    e_idx = None
-    for r in range(w_idx + 2, max_rows):
-        if _clean_str(raw.iloc[r, 0]) == "electrician":
-            e_idx = r
-            break
-    if e_idx is None:
-        raise BackendDataError("Judul Split Ratio 'Electrician' tidak ditemukan.")
-    split_electrician = (
-        _to_float(raw.iloc[e_idx + 1, 0], 0.0),
-        _to_float(raw.iloc[e_idx + 1, 1], 0.0)
-    )
-
-    # --- 7. Ambil Blok 'Lost Time' ---
-    lt_idx = None
-    for r in range(max_rows):
-        if "lost time" in _clean_str(raw.iloc[r, 0]):
-            lt_idx = r
-            break
-    if lt_idx is None:
-        raise BackendDataError("Section 'Lost Time' tidak ditemukan.")
-
-    lost_time = {}
-    curr = lt_idx + 2
-    while curr < max_rows:
-        val_a = raw.iloc[curr, 0]
-        if pd.isna(val_a) or str(val_a).strip() == "":
-            break
-        lost_time[str(val_a).strip()] = _to_float(raw.iloc[curr, 1])
-        curr += 1
+    # Validasi Akhir
+    if not ratio_shift or not lost_time:
+        raise BackendDataError("Tabel Ratio Shift / Lost Time pada BACKEND tidak ditemukan atau kosong.")
+    if any(v is None for v in raci.values()):
+        raise BackendDataError("Proporsi data RACI horizontal pada BACKEND tidak lengkap atau tidak terbaca.")
 
     return BackendData(
-        load_factor=lf_final,
+        load_factor=lf_df,
         ratio_shift=ratio_shift,
         lost_time=lost_time,
         raci=raci,
@@ -217,6 +206,13 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     )
 
 
-def load_backend_data(spreadsheet_id: str = SPREADSHEET_ID, sheet_name: str = BACKEND_SHEET_NAME) -> BackendData:
-    raw = _fetch_raw_csv(sheet_name=sheet_name, spreadsheet_id=spreadsheet_id)
-    return parse_backend(raw)
+def load_backend_data() -> BackendData:
+    """Mengambil data live dari Google Sheets via CSV Export dan mem-parsingnya."""
+    url = gsheet_csv_url(sheet_name=BACKEND_SHEET_NAME, spreadsheet_id=SPREADSHEET_ID)
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        raw_df = pd.read_csv(io.StringIO(response.text), header=None)
+        return parse_backend(raw_df)
+    except Exception as e:
+        raise BackendDataError(f"Gagal memuat atau memproses data dari Google Sheets: {e}")
