@@ -147,7 +147,7 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
         if lf_header_idx is not None:
             j = lf_header_idx + 1
             while j < len(df) and not blank_mask[j]:
-                if "ratio shift" in rows_text[j]:
+                if "Ratio Shift" in rows_text[j]:
                     break
                 j += 1
             lf_end_idx = j
