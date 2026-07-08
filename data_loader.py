@@ -2,14 +2,14 @@
 """
 Robust BACKEND CSV loader + parser with canonical name mapping.
 
-Provides:
- - BackendData dataclass with: load_factor, ratio_shift, raci, split_*, lost_time,
-   sites, sub_categories (display names), units_map (by canonical key)
- - load_backend_data(source=None)
- - parse_backend(raw: pd.DataFrame)
- - Normalization & mapping helpers so selectbox matching is robust.
+Features:
+ - Label-based parsing (no hardcoded row indices)
+ - Safe numeric parsing for values like "1,5", "68%", "", None
+ - Normalization mapping canonical -> original for Sub Category names
+ - BackendData provides units_for(sub), original_sub_name(sub)
+ - load_backend_data(source=None) supports: DataFrame, path/URL, env override, default CSV, Google Sheets export
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 import pandas as pd
 import math
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class BackendDataError(Exception):
+    """Raised when backend data cannot be loaded or parsed cleanly."""
     pass
 
 
@@ -34,9 +35,9 @@ class BackendData:
     split_electrician: List[float]
     lost_time: Dict[str, float]
     sites: List[str]
-    sub_categories: List[str]          # display/original names in order
-    units_map: Dict[str, List[str]]    # keyed by canonical sub_category (normalized)
-    _norm_to_orig: Dict[str, str]      # canonical -> original (first seen)
+    sub_categories: List[str] = field(default_factory=list)        # display/original names in order
+    units_map: Dict[str, List[str]] = field(default_factory=dict)  # keyed by canonical sub_category (normalized)
+    _norm_to_orig: Dict[str, str] = field(default_factory=dict)    # canonical -> original (first seen)
 
     def first_site(self) -> Optional[str]:
         return self.sites[0] if self.sites else None
@@ -50,19 +51,39 @@ class BackendData:
         return s
 
     def units_for(self, sub_category_input: Optional[str]) -> List[str]:
+        """
+        Return list of unit Attributes for a given sub_category_input.
+        Accepts raw original name or a free-form name — matching is case/space-insensitive.
+        """
         if not sub_category_input:
             return []
         nk = self._normalize(sub_category_input)
         return self.units_map.get(nk, [])
 
     def original_sub_name(self, sub_category_input: Optional[str]) -> Optional[str]:
+        """
+        Return the original sub_category string as present in load_factor
+        corresponding to the input (best-effort). If not matched, returns None.
+        """
         if not sub_category_input:
             return None
         nk = self._normalize(sub_category_input)
-        return self._norm_to_orig.get(nk)
+        # prefer explicit mapping if available
+        if isinstance(self._norm_to_orig, dict) and self._norm_to_orig:
+            return self._norm_to_orig.get(nk)
+        # fallback: try to match by normalizing entries in sub_categories
+        for orig in (self.sub_categories or []):
+            try:
+                if self._normalize(orig) == nk:
+                    return orig
+            except Exception:
+                continue
+        return None
 
 
-# Helpers
+# -----------------------
+# Helper utilities
+# -----------------------
 def _row_to_text(row: pd.Series) -> str:
     parts = []
     for c in row.tolist():
@@ -83,6 +104,10 @@ def _is_blank_row(row: pd.Series) -> bool:
 
 
 def _safe_float(value) -> float:
+    """
+    Convert value to float robustly. Returns math.nan on failure.
+    Accepts "1,5", "68%", "  ", None, numeric types.
+    """
     if value is None:
         return math.nan
     if isinstance(value, (int, float)) and not pd.isna(value):
@@ -90,9 +115,11 @@ def _safe_float(value) -> float:
     s = str(value).strip()
     if s == "" or s.lower() in {"nan", "none"}:
         return math.nan
+    # remove percent/whitespace then handle comma decimal
     s = s.replace("%", "").replace(" ", "")
     if "," in s and "." not in s and s.count(",") == 1:
         s = s.replace(",", ".")
+    # remove thousands commas if any remain
     s = s.replace(",", "")
     try:
         return float(s)
@@ -102,6 +129,10 @@ def _safe_float(value) -> float:
 
 
 def _parse_percent_cell(cell) -> float:
+    """
+    Parse a percent-like cell and return fraction (0..1) or math.nan.
+    Accepts '68%', '0.68', '68', '1,5' etc. Heuristic: >1 => percent.
+    """
     if cell is None:
         return math.nan
     s = str(cell).strip()
@@ -136,16 +167,27 @@ def _find_first_row_containing(rows_text: List[str], keyword: str, start: int = 
     return None
 
 
+# -----------------------
+# Main parser
+# -----------------------
 def parse_backend(raw: pd.DataFrame) -> BackendData:
+    """
+    Parse the BACKEND CSV (raw DataFrame).
+    Returns BackendData with mapping and lists populated.
+    """
     df = raw.copy().reset_index(drop=True)
+    # build joined-row texts and blank mask
     rows_text = [_row_to_text(df.iloc[i]) for i in range(len(df))]
     blank_mask = [_is_blank_row(df.iloc[i]) for i in range(len(df))]
 
-    # LOAD FACTOR
+    # ---------------------
+    # 1) Load Factor
+    # ---------------------
     lf_header_idx = _find_first_row_containing(rows_text, "sub category")
     if lf_header_idx is None:
         lf_header_idx = _find_first_row_containing(rows_text, "load factor")
         if lf_header_idx is not None:
+            # header may be title followed by header row
             j = lf_header_idx + 1
             while j < len(df) and blank_mask[j]:
                 j += 1
@@ -157,6 +199,7 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     if lf_header_idx is not None:
         j = lf_header_idx + 1
         while j < len(df) and not blank_mask[j]:
+            # stop early if next block starts
             if "ratio shift" in rows_text[j] or "proporsi raci" in rows_text[j] or "split ratio" in rows_text[j] or "lost time" in rows_text[j]:
                 break
             j += 1
@@ -172,6 +215,7 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
         lf_rows.columns = col_names
         lf_rows.columns = [c if str(c).strip() != "" else f"col_{i}" for i, c in enumerate(lf_rows.columns)]
         lf_df = lf_rows.copy()
+        # identify textual columns (sub category / attribute)
         lower_cols = [str(c).strip().lower() for c in lf_df.columns]
         text_idx = set(i for i, c in enumerate(lower_cols) if "sub" in c or "category" in c or "attr" in c)
         if not text_idx:
@@ -184,7 +228,9 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     else:
         logger.warning("Load Factor block not found")
 
-    # RATIO SHIFT
+    # ---------------------
+    # 2) Ratio Shift
+    # ---------------------
     ratio_shift = {}
     rs_title_idx = _find_first_row_containing(rows_text, "ratio shift")
     if rs_title_idx is not None:
@@ -193,9 +239,10 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
             j += 1
         if j < len(df):
             if "site" in rows_text[j] or "ratio" in rows_text[j]:
-                j2 = j + 1
+                rs_header_idx = j
+                j2 = rs_header_idx + 1
                 while j2 < len(df) and not blank_mask[j2]:
-                    if "proporsi raci" in rows_text[j2] or "raci" in rows_text[j2]:
+                    if "proporsi raci" in rows_text[j2] or rows_text[j2].strip().startswith("proporsi") or "raci" in rows_text[j2]:
                         break
                     row_cells = df.iloc[j2].tolist()
                     site = None
@@ -208,7 +255,9 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
                         ratio_shift[site] = val if val is not None else math.nan
                     j2 += 1
 
-    # RACI
+    # ---------------------
+    # 3) RACI
+    # ---------------------
     raci = {}
     raci_title_idx = _find_first_row_containing(rows_text, "proporsi raci")
     if raci_title_idx is None:
@@ -237,7 +286,9 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
             j += 1
         raci_end_idx = j
 
-    # Split ratios (after raci_end_idx)
+    # ---------------------
+    # 4) Split Ratios (after raci_end_idx)
+    # ---------------------
     def _extract_split_after(role_keyword: str, after_idx: int) -> List[float]:
         target = None
         for i in range((after_idx or 0) + 1, len(df)):
@@ -258,7 +309,9 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
                     target = i
                     break
         if target is None:
+            logger.debug("Split ratio header for %s not found after row %s", role_keyword, after_idx)
             return []
+
         results = []
         j = target + 1
         while j < len(df) and not blank_mask[j]:
@@ -281,15 +334,20 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
             j += 1
         if not results:
             return []
-        normed = [ (math.nan if math.isnan(v) else (v/100.0 if v>1.0 else v)) for v in results ]
-        seen = set(); out=[]
+        normed = [(math.nan if math.isnan(v) else (v / 100.0 if v > 1.0 else v)) for v in results]
+        seen = set()
+        out = []
         for v in normed:
             if math.isnan(v):
-                if "nan" in seen: continue
-                seen.add("nan"); out.append(v)
+                if "nan" in seen:
+                    continue
+                seen.add("nan")
+                out.append(v)
             else:
-                if v in seen: continue
-                seen.add(v); out.append(v)
+                if v in seen:
+                    continue
+                seen.add(v)
+                out.append(v)
         return out
 
     split_mechanic = _extract_split_after("mechanic", raci_end_idx or 0)
@@ -298,32 +356,39 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     if not split_electrician:
         split_electrician = _extract_split_after("electric", raci_end_idx or 0)
 
-    # LOST TIME
+    # ---------------------
+    # 5) Lost Time
+    # ---------------------
     lost_time = {}
-    lt_idx = _find_first_row_containing(rows_text, "lost time")
-    if lt_idx is not None:
-        j = lt_idx + 1
+    lt_title_idx = _find_first_row_containing(rows_text, "lost time")
+    if lt_title_idx is not None:
+        j = lt_title_idx + 1
         while j < len(df) and blank_mask[j]:
             j += 1
         if j < len(df) and ("site" in rows_text[j] or "lost time" in rows_text[j]):
-            start = j + 1
+            start_parse = j + 1
         else:
-            start = j
-        k = start
+            start_parse = j
+        k = start_parse
         while k < len(df) and not blank_mask[k]:
             row_cells = df.iloc[k].tolist()
-            site = None; val=None
-            if len(row_cells) >= 1 and not pd.isna(row_cells[0]) and str(row_cells[0]).strip()!="":
+            site = None
+            val = None
+            if len(row_cells) >= 1 and not pd.isna(row_cells[0]) and str(row_cells[0]).strip() != "":
                 site = str(row_cells[0]).strip()
-            if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip()!="":
+            if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
                 val = _safe_float(row_cells[1])
             if site:
                 lost_time[site] = val if val is not None else math.nan
             k += 1
 
-    for k in ("mechanic","electrician","welder"):
+    # ensure raci keys exist
+    for k in ("mechanic", "electrician", "welder"):
         raci.setdefault(k, math.nan)
 
+    # ---------------------
+    # Compute sites list & sub_categories & units_map
+    # ---------------------
     sites = list(ratio_shift.keys()) if ratio_shift else list(lost_time.keys())
 
     # Build sub_categories and units_map using normalization mapping
@@ -332,8 +397,9 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     norm_to_orig = {}
     if not lf_df.empty:
         lower_cols = [str(c).strip().lower() for c in lf_df.columns]
-        sub_col_idx = None; attr_col_idx = None
-        for idx,c in enumerate(lower_cols):
+        sub_col_idx = None
+        attr_col_idx = None
+        for idx, c in enumerate(lower_cols):
             if "sub" in c or "category" in c:
                 sub_col_idx = idx
             if "attr" in c or "attribute" in c or "jenis" in c:
@@ -341,13 +407,17 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
         if sub_col_idx is None:
             sub_col_idx = 0
         if attr_col_idx is None:
-            attr_col_idx = 1 if lf_df.shape[1] >=2 else None
+            attr_col_idx = 1 if lf_df.shape[1] >= 2 else None
 
         raw_subs = lf_df.iloc[:, sub_col_idx].astype(str).apply(lambda s: s.strip()).tolist()
-        raw_attrs = lf_df.iloc[:, attr_col_idx].astype(str).apply(lambda s: s.strip()) if attr_col_idx is not None else pd.Series([""]*len(raw_subs))
+        if attr_col_idx is not None:
+            raw_attrs = lf_df.iloc[:, attr_col_idx].astype(str).apply(lambda s: s.strip())
+        else:
+            raw_attrs = pd.Series([""] * len(raw_subs))
+
         seen = set()
         for i, sub in enumerate(raw_subs):
-            if not sub or sub.lower()=="nan":
+            if not sub or sub.lower() == "nan":
                 continue
             orig = sub
             nk = re.sub(r"\s+", " ", orig.strip().lower())
@@ -361,17 +431,20 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
                 attr_val = str(raw_attrs.iloc[i]).strip()
             except Exception:
                 attr_val = ""
-            if attr_val and attr_val.lower()!="nan":
+            if attr_val and attr_val.lower() != "nan":
                 units_map.setdefault(nk, []).append(attr_val)
-        for k,v in list(units_map.items()):
-            out=[]
-            s=set()
+        # dedupe attributes per sub
+        for k, v in list(units_map.items()):
+            out = []
+            sset = set()
             for x in v:
-                if x not in s:
-                    s.add(x); out.append(x)
-            units_map[k]=out
+                if x not in sset:
+                    sset.add(x)
+                    out.append(x)
+            units_map[k] = out
 
-    return BackendData(
+    # build BackendData and include norm map
+    bd = BackendData(
         load_factor=lf_df,
         ratio_shift=ratio_shift,
         raci=raci,
@@ -384,9 +457,20 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
         units_map=units_map,
         _norm_to_orig=norm_to_orig,
     )
+    return bd
 
 
+# -----------------------
+# Loader with fallbacks
+# -----------------------
 def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> BackendData:
+    """
+    Load backend data from:
+     - pandas.DataFrame (if provided)
+     - str path or URL (if provided)
+     - None: try env var BACKEND_CSV_PATH, then BACKEND_CSV_URL, then default file name,
+             then Google Sheets export URL.
+    """
     GOOGLE_SHEET_ID = "1YRvXt0AE-dVBVwRvLtsb57Qz8DYd9YbVQlVbRD31C7I"
     GOOGLE_SHEET_GID = "1437049322"
     google_export_url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={GOOGLE_SHEET_GID}"
@@ -395,23 +479,40 @@ def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> Back
         if isinstance(source, pd.DataFrame):
             raw = source
             return parse_backend(raw)
+
         if isinstance(source, str):
-            raw = pd.read_csv(source, header=None, dtype=str)
+            src = source.strip()
+            try:
+                raw = pd.read_csv(src, header=None, dtype=str)
+            except Exception as e:
+                logger.debug("Failed reading source %r via pandas: %s", src, e)
+                raise BackendDataError(f"Failed to read CSV from {src}") from e
             return parse_backend(raw)
+
+        # try env var path
         env_path = os.getenv("BACKEND_CSV_PATH")
         if env_path and os.path.exists(env_path):
             raw = pd.read_csv(env_path, header=None, dtype=str)
             return parse_backend(raw)
+
+        # try env var URL
         env_url = os.getenv("BACKEND_CSV_URL")
         if env_url:
             raw = pd.read_csv(env_url, header=None, dtype=str)
             return parse_backend(raw)
+
+        # default local filename
         default_fname = "FTE - BACKEND (2).csv"
         if os.path.exists(default_fname):
             raw = pd.read_csv(default_fname, header=None, dtype=str)
             return parse_backend(raw)
+
+        # try Google Sheets export URL
         raw = pd.read_csv(google_export_url, header=None, dtype=str)
         return parse_backend(raw)
+
+    except BackendDataError:
+        raise
     except Exception as e:
         logger.exception("Failed to load backend data")
         raise BackendDataError("Failed to load backend data") from e
