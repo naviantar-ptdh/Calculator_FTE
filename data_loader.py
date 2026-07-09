@@ -1,13 +1,44 @@
 # data_loader.py
 """
-Robust BACKEND CSV loader + parser with canonical name mapping.
+BACKEND CSV/XLSX loader + parser — versi dinamis, anti hardcoded-row-index.
 
-Features:
- - Label-based parsing (no hardcoded row indices)
- - Safe numeric parsing for values like "1,5", "68%", "", None
- - Normalization mapping canonical -> original for Sub Category names
- - BackendData provides units_for(sub), original_sub_name(sub)
- - load_backend_data(source=None) supports: DataFrame, path/URL, env override, default CSV, Google Sheets export
+Struktur sheet BACKEND (Kolom A berisi judul seksi UNIK, dicari via scanning teks,
+bukan nomor baris):
+
+    Blok 1: "Load Factor"
+        -> header berikutnya: Sub Category | Attribute | Load Mechanic | Load Electrican | Load Welder
+        -> baris data sampai ketemu baris kosong
+
+    Blok 2: "Ratio Shift"
+        -> header berikutnya (opsional): Site | Ratio
+        -> baris data Site,Ratio sampai baris kosong
+
+    Blok 3: "Proporsi RACI"
+        -> baris vertikal langsung di bawah judul: label di Kolom A
+           ("Mechanic" / "Electric(ian)" / "Welder"), nilai di Kolom B
+        -> sampai baris kosong
+
+    Blok 4: "Split Ratio Mechanic"
+        -> baris vertikal (M1/M2/M3, nilai di Kolom B) sampai baris kosong
+
+    Blok 5: "Split Ratio Welder"
+        -> baris vertikal (M1/M2, nilai di Kolom B) sampai baris kosong
+
+    Blok 6: "Split Ratio Electrician"
+        -> baris vertikal (M1/M2, nilai di Kolom B) sampai baris kosong
+
+    Blok 7: "Lost Time"
+        -> baris data Site,Value sampai baris kosong / akhir file
+
+Prinsip desain:
+ - TIDAK ADA nomor baris hardcoded di mana pun. Semua seksi dicari dengan
+   mencocokkan teks Kolom A (case-insensitive, di-strip) terhadap judul seksi.
+ - Pencarian Split Ratio dimulai SETELAH blok RACI selesai (raci_end_idx),
+   supaya urut dan tidak pernah salah tabrakan walau ada perubahan sheet di masa depan.
+ - `load_factor` diberi index = Sub Category (bukan RangeIndex default!) supaya
+   `backend.load_factor.loc[sub_category]` di calculator.py benar-benar bekerja.
+ - Key dict `raci` distandardisasi menjadi persis "Mechanic" / "Electric" / "Welder"
+   (sesuai config.ROLES dan apa yang dipakai calculator.py) — bukan "mechanic"/"electrician".
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
@@ -27,22 +58,23 @@ class BackendDataError(Exception):
 
 @dataclass
 class BackendData:
-    load_factor: pd.DataFrame
-    ratio_shift: Dict[str, float]
-    raci: Dict[str, float]
-    split_mechanic: List[float]
-    split_welder: List[float]
-    split_electrician: List[float]
-    lost_time: Dict[str, float]
+    load_factor: pd.DataFrame                                       # index = Sub Category
+    ratio_shift: Dict[str, float]                                    # Site -> ratio
+    raci: Dict[str, float]                                           # "Mechanic"/"Electric"/"Welder" -> fraction
+    split_mechanic: List[float]                                      # [M1, M2, M3]
+    split_welder: List[float]                                        # [M1, M2]
+    split_electrician: List[float]                                   # [M1, M2]
+    lost_time: Dict[str, float]                                      # Site -> jam
     sites: List[str]
-    sub_categories: List[str] = field(default_factory=list)        # display/original names in order
-    units_map: Dict[str, List[str]] = field(default_factory=dict)  # keyed by canonical sub_category (normalized)
-    _norm_to_orig: Dict[str, str] = field(default_factory=dict)    # canonical -> original (first seen)
+    sub_categories: List[str] = field(default_factory=list)          # untuk dropdown UI
+    units_map: Dict[str, List[str]] = field(default_factory=dict)    # canonical sub -> [Attribute,...]
+    _norm_to_orig: Dict[str, str] = field(default_factory=dict)      # canonical -> original Sub Category
 
     def first_site(self) -> Optional[str]:
         return self.sites[0] if self.sites else None
 
-    def _normalize(self, s: Optional[str]) -> str:
+    @staticmethod
+    def _normalize(s: Optional[str]) -> str:
         if s is None:
             return ""
         s = str(s).strip().lower()
@@ -51,51 +83,44 @@ class BackendData:
         return s
 
     def units_for(self, sub_category_input: Optional[str]) -> List[str]:
-        """
-        Return list of unit Attributes for a given sub_category_input.
-        Accepts raw original name or a free-form name — matching is case/space-insensitive.
-        """
         if not sub_category_input:
             return []
-        nk = self._normalize(sub_category_input)
-        return self.units_map.get(nk, [])
+        return self.units_map.get(self._normalize(sub_category_input), [])
 
     def original_sub_name(self, sub_category_input: Optional[str]) -> Optional[str]:
-        """
-        Return the original sub_category string as present in load_factor
-        corresponding to the input (best-effort). If not matched, returns None.
-        """
+        """Cocokkan input (bebas huruf besar/kecil, spasi) ke nama asli di load_factor.index."""
         if not sub_category_input:
             return None
         nk = self._normalize(sub_category_input)
-        # prefer explicit mapping if available
-        if isinstance(self._norm_to_orig, dict) and self._norm_to_orig:
-            return self._norm_to_orig.get(nk)
-        # fallback: try to match by normalizing entries in sub_categories
-        for orig in (self.sub_categories or []):
-            try:
-                if self._normalize(orig) == nk:
-                    return orig
-            except Exception:
-                continue
+        if self._norm_to_orig:
+            hit = self._norm_to_orig.get(nk)
+            if hit:
+                return hit
+        for orig in self.sub_categories or []:
+            if self._normalize(orig) == nk:
+                return orig
         return None
 
 
 # -----------------------
 # Helper utilities
 # -----------------------
-def _row_to_text(row: pd.Series) -> str:
-    parts = []
-    for c in row.tolist():
-        if pd.isna(c):
-            parts.append("")
-        else:
-            parts.append(str(c))
-    return " ".join(parts).strip().lower()
+def _cell(df: pd.DataFrame, r: int, c: int):
+    if r < 0 or r >= len(df) or c < 0 or c >= df.shape[1]:
+        return None
+    v = df.iat[r, c]
+    return None if pd.isna(v) else v
 
 
-def _is_blank_row(row: pd.Series) -> bool:
-    for c in row.tolist():
+def _col_text(df: pd.DataFrame, r: int, c: int = 0) -> str:
+    v = _cell(df, r, c)
+    return "" if v is None else str(v).strip()
+
+
+def _is_blank_row(df: pd.DataFrame, r: int) -> bool:
+    if r >= len(df):
+        return True
+    for c in df.iloc[r].tolist():
         if pd.isna(c):
             continue
         if str(c).strip() != "":
@@ -104,22 +129,18 @@ def _is_blank_row(row: pd.Series) -> bool:
 
 
 def _safe_float(value) -> float:
-    """
-    Convert value to float robustly. Returns math.nan on failure.
-    Accepts "1,5", "68%", "  ", None, numeric types.
-    """
+    """Konversi ke float secara aman. Mengembalikan math.nan jika gagal.
+    Menerima '1,5', '68%', '  ', None, tipe numerik."""
     if value is None:
         return math.nan
     if isinstance(value, (int, float)) and not pd.isna(value):
         return float(value)
     s = str(value).strip()
-    if s == "" or s.lower() in {"nan", "none"}:
+    if s == "" or s.lower() in {"nan", "none", "-"}:
         return math.nan
-    # remove percent/whitespace then handle comma decimal
     s = s.replace("%", "").replace(" ", "")
     if "," in s and "." not in s and s.count(",") == 1:
         s = s.replace(",", ".")
-    # remove thousands commas if any remain
     s = s.replace(",", "")
     try:
         return float(s)
@@ -128,11 +149,9 @@ def _safe_float(value) -> float:
         return math.nan
 
 
-def _parse_percent_cell(cell) -> float:
-    """
-    Parse a percent-like cell and return fraction (0..1) or math.nan.
-    Accepts '68%', '0.68', '68', '1,5' etc. Heuristic: >1 => percent.
-    """
+def _parse_fraction_cell(cell) -> float:
+    """Parse sel yang merepresentasikan proporsi/pecahan (mis. RACI, Split Ratio).
+    Menerima '68%', '0.68', '68', '1,5' dll. Heuristik: nilai > 1 dianggap persen."""
     if cell is None:
         return math.nan
     s = str(cell).strip()
@@ -147,303 +166,196 @@ def _parse_percent_cell(cell) -> float:
     return v / 100.0 if v > 1.0 else v
 
 
-def _unique_preserve(seq):
-    seen = set()
-    out = []
-    for s in seq:
-        if s is None:
-            continue
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-def _find_first_row_containing(rows_text: List[str], keyword: str, start: int = 0) -> Optional[int]:
-    kw = keyword.strip().lower()
-    for i in range(start, len(rows_text)):
-        if kw in rows_text[i]:
+def _find_title_row(df: pd.DataFrame, title: str, start: int = 0) -> Optional[int]:
+    """Cari baris yang Kolom A-nya PERSIS sama dengan judul seksi (case/space-insensitive)."""
+    t = title.strip().lower()
+    for i in range(start, len(df)):
+        if _col_text(df, i, 0).strip().lower() == t:
             return i
     return None
+
+
+def _read_vertical_pairs_safe(df: pd.DataFrame, start_row: int):
+    """Baca pasangan (label_kolomA, nilai_kolomB) mulai dari start_row sampai baris kosong.
+    Mengembalikan (list_pairs, baris_setelah_blok)."""
+    pairs = []
+    r = start_row
+    while r < len(df) and not _is_blank_row(df, r):
+        label = _col_text(df, r, 0)
+        val = _cell(df, r, 1)
+        if label:
+            pairs.append((label, val))
+        r += 1
+    return pairs, r
 
 
 # -----------------------
 # Main parser
 # -----------------------
 def parse_backend(raw: pd.DataFrame) -> BackendData:
-    """
-    Parse the BACKEND CSV (raw DataFrame).
-    Returns BackendData with mapping and lists populated.
-    """
     df = raw.copy().reset_index(drop=True)
-    # build joined-row texts and blank mask
-    rows_text = [_row_to_text(df.iloc[i]) for i in range(len(df))]
-    blank_mask = [_is_blank_row(df.iloc[i]) for i in range(len(df))]
 
-    # ---------------------
-    # 1) Load Factor
-    # ---------------------
-    lf_header_idx = _find_first_row_containing(rows_text, "sub category")
-    if lf_header_idx is None:
-        lf_header_idx = _find_first_row_containing(rows_text, "load factor")
-        if lf_header_idx is not None:
-            # header may be title followed by header row
-            j = lf_header_idx + 1
-            while j < len(df) and blank_mask[j]:
-                j += 1
-            lf_header_idx = j if j < len(df) else None
-    if lf_header_idx is None:
-        lf_header_idx = _find_first_row_containing(rows_text, "attribute")  # fallback
+    # =========================================================
+    # Blok 1: Load Factor
+    # =========================================================
+    lf_title_idx = _find_title_row(df, "load factor")
+    if lf_title_idx is None:
+        raise BackendDataError("Seksi 'Load Factor' tidak ditemukan di Kolom A BACKEND.")
 
-    lf_end_idx = None
-    if lf_header_idx is not None:
-        j = lf_header_idx + 1
-        while j < len(df) and not blank_mask[j]:
-            # stop early if next block starts
-            if "ratio shift" in rows_text[j] or "proporsi raci" in rows_text[j] or "split ratio" in rows_text[j] or "lost time" in rows_text[j]:
-                break
-            j += 1
-        lf_end_idx = j
+    header_idx = lf_title_idx + 1
+    while header_idx < len(df) and _is_blank_row(df, header_idx):
+        header_idx += 1
+    if header_idx >= len(df):
+        raise BackendDataError("Header tabel 'Load Factor' tidak ditemukan.")
 
-    lf_df = pd.DataFrame()
-    if lf_header_idx is not None and lf_end_idx is not None and lf_end_idx > lf_header_idx:
-        header_row = df.iloc[lf_header_idx].astype(str).tolist()
-        col_names = [str(c).strip() for c in header_row]
-        lf_rows = df.iloc[lf_header_idx + 1:lf_end_idx].copy()
-        if lf_rows.shape[1] != len(col_names):
-            col_names = [f"col_{i}" for i in range(lf_rows.shape[1])]
-        lf_rows.columns = col_names
-        lf_rows.columns = [c if str(c).strip() != "" else f"col_{i}" for i, c in enumerate(lf_rows.columns)]
-        lf_df = lf_rows.copy()
-        # identify textual columns (sub category / attribute)
-        lower_cols = [str(c).strip().lower() for c in lf_df.columns]
-        text_idx = set(i for i, c in enumerate(lower_cols) if "sub" in c or "category" in c or "attr" in c)
-        if not text_idx:
-            text_idx.update({0, 1} if lf_df.shape[1] >= 2 else {0})
-        for idx, col in enumerate(lf_df.columns):
-            if idx in text_idx:
-                lf_df[col] = lf_df[col].apply(lambda v: "" if pd.isna(v) else str(v).strip())
-            else:
-                lf_df[col] = lf_df[col].apply(lambda v: (_safe_float(v) if isinstance(v, str) or pd.isna(v) else (float(v) if not pd.isna(v) else math.nan)))
-    else:
-        logger.warning("Load Factor block not found")
+    header_cells = [str(x).strip() if not pd.isna(x) else "" for x in df.iloc[header_idx].tolist()]
+    header_lower = [h.lower() for h in header_cells]
 
-    # ---------------------
-    # 2) Ratio Shift
-    # ---------------------
-    ratio_shift = {}
-    rs_title_idx = _find_first_row_containing(rows_text, "ratio shift")
+    def _find_col(*keywords) -> Optional[int]:
+        for idx, h in enumerate(header_lower):
+            if all(kw in h for kw in keywords):
+                return idx
+        return None
+
+    col_sub = _find_col("sub")
+    col_attr = _find_col("attribute")
+    col_mech = _find_col("mechanic")
+    col_elec = _find_col("electr")  # menangkap "Electrican"/"Electrician" (typo aman)
+    col_weld = _find_col("welder")
+
+    if col_sub is None:
+        raise BackendDataError("Kolom 'Sub Category' tidak ditemukan pada header Load Factor.")
+
+    data_start = header_idx + 1
+    data_end = data_start
+    while data_end < len(df) and not _is_blank_row(df, data_end):
+        data_end += 1
+
+    lf_records = []
+    for r in range(data_start, data_end):
+        sub = _col_text(df, r, col_sub)
+        if not sub or sub.lower() == "nan":
+            continue
+        rec = {
+            "Sub Category": sub,
+            "Attribute": _col_text(df, r, col_attr) if col_attr is not None else "",
+            "Load Mechanic": _safe_float(_cell(df, r, col_mech)) if col_mech is not None else math.nan,
+            "Load Electrican": _safe_float(_cell(df, r, col_elec)) if col_elec is not None else math.nan,
+            "Load Welder": _safe_float(_cell(df, r, col_weld)) if col_weld is not None else math.nan,
+        }
+        lf_records.append(rec)
+
+    if not lf_records:
+        raise BackendDataError("Tabel 'Load Factor' ditemukan tapi tidak ada baris data.")
+
+    lf_df = pd.DataFrame(lf_records)
+    # Buang duplikat Sub Category (pertahankan kemunculan pertama) lalu jadikan index.
+    dupes = lf_df["Sub Category"][lf_df["Sub Category"].duplicated()].unique().tolist()
+    if dupes:
+        logger.warning("Sub Category duplikat di Load Factor (dipertahankan yang pertama): %s", dupes)
+    lf_df = lf_df.drop_duplicates(subset="Sub Category", keep="first").set_index("Sub Category")
+
+    sub_categories = lf_df.index.tolist()
+
+    # units_map / norm map (dipakai app.py untuk dropdown & original_sub_name)
+    units_map: Dict[str, List[str]] = {}
+    norm_to_orig: Dict[str, str] = {}
+    for sub, row in lf_df.iterrows():
+        nk = BackendData._normalize(sub)
+        norm_to_orig.setdefault(nk, sub)
+        attr_val = str(row.get("Attribute", "")).strip()
+        if attr_val and attr_val.lower() not in ("nan", "-", ""):
+            units_map.setdefault(nk, [])
+            if attr_val not in units_map[nk]:
+                units_map[nk].append(attr_val)
+
+    # =========================================================
+    # Blok 2: Ratio Shift
+    # =========================================================
+    ratio_shift: Dict[str, float] = {}
+    rs_title_idx = _find_title_row(df, "ratio shift", start=data_end)
     if rs_title_idx is not None:
         j = rs_title_idx + 1
-        while j < len(df) and blank_mask[j]:
+        while j < len(df) and _is_blank_row(df, j):
             j += 1
-        if j < len(df):
-            if "site" in rows_text[j] or "ratio" in rows_text[j]:
-                rs_header_idx = j
-                j2 = rs_header_idx + 1
-                while j2 < len(df) and not blank_mask[j2]:
-                    if "proporsi raci" in rows_text[j2] or rows_text[j2].strip().startswith("proporsi") or "raci" in rows_text[j2]:
-                        break
-                    row_cells = df.iloc[j2].tolist()
-                    site = None
-                    val = None
-                    if len(row_cells) >= 1 and not pd.isna(row_cells[0]) and str(row_cells[0]).strip() != "":
-                        site = str(row_cells[0]).strip()
-                    if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
-                        val = _safe_float(row_cells[1])
-                    if site:
-                        ratio_shift[site] = val if val is not None else math.nan
-                    j2 += 1
+        # skip baris header "Site | Ratio" jika ada
+        if j < len(df) and "site" in _col_text(df, j, 0).lower():
+            j += 1
+        pairs, rs_end = _read_vertical_pairs_safe(df, j)
+        for site, val in pairs:
+            ratio_shift[site] = _safe_float(val)
+    else:
+        logger.warning("Seksi 'Ratio Shift' tidak ditemukan.")
+        rs_end = data_end
 
-    # ---------------------
-    # 3) RACI
-    # ---------------------
-    raci = {}
-    raci_title_idx = _find_first_row_containing(rows_text, "proporsi raci")
+    # =========================================================
+    # Blok 3: Proporsi RACI (vertikal: label di Kol A, nilai di Kol B)
+    # =========================================================
+    raci: Dict[str, float] = {}
+    raci_title_idx = _find_title_row(df, "proporsi raci", start=rs_end)
     if raci_title_idx is None:
-        raci_title_idx = _find_first_row_containing(rows_text, "raci")
-    raci_end_idx = raci_title_idx
+        raci_title_idx = _find_title_row(df, "raci", start=rs_end)
+
+    raci_end_idx = rs_end
     if raci_title_idx is not None:
-        j = raci_title_idx + 1
-        while j < len(df) and not blank_mask[j]:
-            txt = rows_text[j]
-            for r in ("mechanic", "electric", "electrician", "welder"):
-                if r in txt:
-                    row_cells = df.iloc[j].tolist()
-                    val = None
-                    if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
-                        val = _parse_percent_cell(row_cells[1])
-                    else:
-                        for c in row_cells[1:]:
-                            if not pd.isna(c) and str(c).strip() != "":
-                                maybe = _parse_percent_cell(c)
-                                if not math.isnan(maybe):
-                                    val = maybe
-                                    break
-                    name = "electrician" if r in ("electric", "electrician") else r
-                    raci[name] = val if val is not None else math.nan
-                    break
-            j += 1
-        raci_end_idx = j
-
-    # ---------------------
-    # 4) Split Ratios (after raci_end_idx)
-    # ---------------------
-    def _extract_split_after(role_keyword: str, after_idx: int) -> List[float]:
-        target = None
-        for i in range((after_idx or 0) + 1, len(df)):
-            rt = rows_text[i]
-            if ("split ratio" in rt and role_keyword in rt) or (f"split ratio {role_keyword}" in rt):
-                target = i
-                break
-        if target is None:
-            for i in range((after_idx or 0) + 1, len(df)):
-                rt = rows_text[i]
-                if role_keyword in rt and "split" in rt:
-                    target = i
-                    break
-        if target is None:
-            for i in range((after_idx or 0) + 1, len(df)):
-                first_cell = str(df.iloc[i, 0]) if df.shape[1] >= 1 else ""
-                if first_cell.strip().lower() == role_keyword:
-                    target = i
-                    break
-        if target is None:
-            logger.debug("Split ratio header for %s not found after row %s", role_keyword, after_idx)
-            return []
-
-        results = []
-        j = target + 1
-        while j < len(df) and not blank_mask[j]:
-            if "%" in rows_text[j] or any(ch.isdigit() for ch in rows_text[j]):
-                row_cells = df.iloc[j].tolist()
-                for c in row_cells:
-                    if pd.isna(c):
-                        continue
-                    s = str(c).strip()
-                    if s == "":
-                        continue
-                    v = _parse_percent_cell(s)
-                    if math.isnan(v):
-                        v = _safe_float(s)
-                        if math.isnan(v):
-                            continue
-                    results.append(v)
+        pairs, raci_end_idx = _read_vertical_pairs_safe(df, raci_title_idx + 1)
+        for label, val in pairs:
+            ll = label.strip().lower()
+            if ll.startswith("mechanic"):
+                key = "Mechanic"
+            elif ll.startswith("electr"):
+                key = "Electric"
+            elif ll.startswith("welder"):
+                key = "Welder"
             else:
-                break
-            j += 1
-        if not results:
+                continue
+            raci[key] = _parse_fraction_cell(val)
+    else:
+        logger.warning("Seksi 'Proporsi RACI' tidak ditemukan.")
+
+    for key in ("Mechanic", "Electric", "Welder"):
+        raci.setdefault(key, math.nan)
+
+    # =========================================================
+    # Blok 4-6: Split Ratio Mechanic / Welder / Electrician
+    # Pencarian dimulai SETELAH blok RACI selesai (raci_end_idx), sesuai urutan sheet.
+    # =========================================================
+    def _extract_split(section_title: str, start: int) -> List[float]:
+        title_idx = _find_title_row(df, section_title, start=start)
+        if title_idx is None:
+            logger.warning("Seksi '%s' tidak ditemukan.", section_title)
             return []
-        normed = [(math.nan if math.isnan(v) else (v / 100.0 if v > 1.0 else v)) for v in results]
-        seen = set()
-        out = []
-        for v in normed:
-            if math.isnan(v):
-                if "nan" in seen:
-                    continue
-                seen.add("nan")
-                out.append(v)
-            else:
-                if v in seen:
-                    continue
-                seen.add(v)
-                out.append(v)
-        return out
+        pairs, _end = _read_vertical_pairs_safe(df, title_idx + 1)
+        values = []
+        for _label, val in pairs:
+            v = _parse_fraction_cell(val)
+            if not math.isnan(v):
+                values.append(v)
+        return values
 
-    split_mechanic = _extract_split_after("mechanic", raci_end_idx or 0)
-    split_welder = _extract_split_after("welder", raci_end_idx or 0)
-    split_electrician = _extract_split_after("electrician", raci_end_idx or 0)
-    if not split_electrician:
-        split_electrician = _extract_split_after("electric", raci_end_idx or 0)
+    split_mechanic = _extract_split("split ratio mechanic", raci_end_idx)
+    split_welder = _extract_split("split ratio welder", raci_end_idx)
+    split_electrician = _extract_split("split ratio electrician", raci_end_idx)
 
-    # ---------------------
-    # 5) Lost Time
-    # ---------------------
-    lost_time = {}
-    lt_title_idx = _find_first_row_containing(rows_text, "lost time")
+    # =========================================================
+    # Blok 7: Lost Time
+    # =========================================================
+    lost_time: Dict[str, float] = {}
+    lt_title_idx = _find_title_row(df, "lost time", start=raci_end_idx)
     if lt_title_idx is not None:
         j = lt_title_idx + 1
-        while j < len(df) and blank_mask[j]:
+        while j < len(df) and _is_blank_row(df, j):
             j += 1
-        if j < len(df) and ("site" in rows_text[j] or "lost time" in rows_text[j]):
-            start_parse = j + 1
-        else:
-            start_parse = j
-        k = start_parse
-        while k < len(df) and not blank_mask[k]:
-            row_cells = df.iloc[k].tolist()
-            site = None
-            val = None
-            if len(row_cells) >= 1 and not pd.isna(row_cells[0]) and str(row_cells[0]).strip() != "":
-                site = str(row_cells[0]).strip()
-            if len(row_cells) >= 2 and not pd.isna(row_cells[1]) and str(row_cells[1]).strip() != "":
-                val = _safe_float(row_cells[1])
-            if site:
-                lost_time[site] = val if val is not None else math.nan
-            k += 1
+        if j < len(df) and "site" in _col_text(df, j, 0).lower():
+            j += 1
+        pairs, _end = _read_vertical_pairs_safe(df, j)
+        for site, val in pairs:
+            lost_time[site] = _safe_float(val)
+    else:
+        logger.warning("Seksi 'Lost Time' tidak ditemukan.")
 
-    # ensure raci keys exist
-    for k in ("mechanic", "electrician", "welder"):
-        raci.setdefault(k, math.nan)
+    sites = list(ratio_shift.keys()) or list(lost_time.keys())
 
-    # ---------------------
-    # Compute sites list & sub_categories & units_map
-    # ---------------------
-    sites = list(ratio_shift.keys()) if ratio_shift else list(lost_time.keys())
-
-    # Build sub_categories and units_map using normalization mapping
-    sub_categories = []
-    units_map = {}
-    norm_to_orig = {}
-    if not lf_df.empty:
-        lower_cols = [str(c).strip().lower() for c in lf_df.columns]
-        sub_col_idx = None
-        attr_col_idx = None
-        for idx, c in enumerate(lower_cols):
-            if "sub" in c or "category" in c:
-                sub_col_idx = idx
-            if "attr" in c or "attribute" in c or "jenis" in c:
-                attr_col_idx = idx
-        if sub_col_idx is None:
-            sub_col_idx = 0
-        if attr_col_idx is None:
-            attr_col_idx = 1 if lf_df.shape[1] >= 2 else None
-
-        raw_subs = lf_df.iloc[:, sub_col_idx].astype(str).apply(lambda s: s.strip()).tolist()
-        if attr_col_idx is not None:
-            raw_attrs = lf_df.iloc[:, attr_col_idx].astype(str).apply(lambda s: s.strip())
-        else:
-            raw_attrs = pd.Series([""] * len(raw_subs))
-
-        seen = set()
-        for i, sub in enumerate(raw_subs):
-            if not sub or sub.lower() == "nan":
-                continue
-            orig = sub
-            nk = re.sub(r"\s+", " ", orig.strip().lower())
-            nk = re.sub(r"[^\w\s]", "", nk)
-            if nk not in seen:
-                seen.add(nk)
-                sub_categories.append(orig)
-                norm_to_orig[nk] = orig
-            attr_val = ""
-            try:
-                attr_val = str(raw_attrs.iloc[i]).strip()
-            except Exception:
-                attr_val = ""
-            if attr_val and attr_val.lower() != "nan":
-                units_map.setdefault(nk, []).append(attr_val)
-        # dedupe attributes per sub
-        for k, v in list(units_map.items()):
-            out = []
-            sset = set()
-            for x in v:
-                if x not in sset:
-                    sset.add(x)
-                    out.append(x)
-            units_map[k] = out
-
-    # build BackendData and include norm map
     bd = BackendData(
         load_factor=lf_df,
         ratio_shift=ratio_shift,
@@ -461,58 +373,61 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
 
 
 # -----------------------
-# Loader with fallbacks
+# Loader dengan fallback sumber
 # -----------------------
 def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> BackendData:
     """
-    Load backend data from:
-     - pandas.DataFrame (if provided)
-     - str path or URL (if provided)
-     - None: try env var BACKEND_CSV_PATH, then BACKEND_CSV_URL, then default file name,
-             then Google Sheets export URL.
+    Urutan sumber data:
+     1. DataFrame langsung (jika diberikan)
+     2. str path/URL (jika diberikan)
+     3. env var BACKEND_CSV_PATH
+     4. env var BACKEND_CSV_URL
+     5. file lokal default "FTE - BACKEND (2).csv"
+     6. Google Sheets export URL, dibangun dari config.py (SPREADSHEET_ID + BACKEND_SHEET_NAME)
+        via gsheet_csv_url() — supaya SATU sumber kebenaran, tidak ada URL/gid duplikat/hardcoded
+        yang bisa berbeda dari config.py.
     """
-    GOOGLE_SHEET_ID = "1YRvXt0AE-dVBVwRvLtsb57Qz8DYd9YbVQlVbRD31C7I"
-    GOOGLE_SHEET_GID = "1437049322"
-    google_export_url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={GOOGLE_SHEET_GID}"
-
     try:
         if isinstance(source, pd.DataFrame):
-            raw = source
-            return parse_backend(raw)
+            return parse_backend(source)
 
         if isinstance(source, str):
-            src = source.strip()
             try:
-                raw = pd.read_csv(src, header=None, dtype=str)
+                raw = pd.read_csv(source.strip(), header=None, dtype=str)
             except Exception as e:
-                logger.debug("Failed reading source %r via pandas: %s", src, e)
-                raise BackendDataError(f"Failed to read CSV from {src}") from e
+                raise BackendDataError(f"Gagal membaca CSV dari {source}") from e
             return parse_backend(raw)
 
-        # try env var path
         env_path = os.getenv("BACKEND_CSV_PATH")
         if env_path and os.path.exists(env_path):
             raw = pd.read_csv(env_path, header=None, dtype=str)
             return parse_backend(raw)
 
-        # try env var URL
         env_url = os.getenv("BACKEND_CSV_URL")
         if env_url:
             raw = pd.read_csv(env_url, header=None, dtype=str)
             return parse_backend(raw)
 
-        # default local filename
         default_fname = "FTE - BACKEND (2).csv"
         if os.path.exists(default_fname):
             raw = pd.read_csv(default_fname, header=None, dtype=str)
             return parse_backend(raw)
 
-        # try Google Sheets export URL
-        raw = pd.read_csv(google_export_url, header=None, dtype=str)
+        # Sumber Google Sheets — dibangun dari config.py, bukan hardcoded di sini.
+        try:
+            from config import SPREADSHEET_ID, BACKEND_SHEET_NAME, gsheet_csv_url
+            url = gsheet_csv_url(BACKEND_SHEET_NAME, SPREADSHEET_ID)
+        except ImportError:
+            # fallback terakhir jika config.py tidak tersedia sama sekali
+            url = (
+                "https://docs.google.com/spreadsheets/d/"
+                "1YRvXt0AE-dVBVwRvLtsb57Qz8DYd9YbVQlVbRD31C7I/gviz/tq?tqx=out:csv&sheet=BACKEND"
+            )
+        raw = pd.read_csv(url, header=None, dtype=str)
         return parse_backend(raw)
 
     except BackendDataError:
         raise
     except Exception as e:
-        logger.exception("Failed to load backend data")
-        raise BackendDataError("Failed to load backend data") from e
+        logger.exception("Gagal memuat backend data")
+        raise BackendDataError("Gagal memuat backend data") from e
