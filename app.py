@@ -57,6 +57,17 @@ def main():
 
     sub_opts = backend.sub_categories or []
 
+    with st.expander("🔧 Debug BACKEND (klik untuk buka jika ada error 'Sub Category tidak ditemukan')"):
+        st.write("Jumlah Sub Category terbaca:", len(sub_opts))
+        st.write("Isi load_factor.index (repr, untuk cek karakter tersembunyi):")
+        st.code("\n".join(repr(x) for x in backend.load_factor.index.tolist()))
+        st.write("Tipe index:", type(backend.load_factor.index).__name__)
+        st.write("RACI:", backend.raci)
+        st.write("Sites:", backend.sites)
+        if st.button("🔄 Clear cache & reload BACKEND"):
+            st.cache_data.clear()
+            st.rerun()
+
     with st.sidebar:
         st.header("General Parameters")
         sites = backend.sites or []
@@ -76,7 +87,7 @@ def main():
     edited = st.data_editor(
         df,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "sub_category": st.column_config.SelectboxColumn(
                 "Sub Category", options=sub_opts, required=True,
