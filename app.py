@@ -6,8 +6,8 @@ Desain diselaraskan dengan HR Recruitment Portal (naviantar-ptdh/202605-centrali
 import streamlit as st
 import pandas as pd
 from typing import Dict
-from calculator import FTEInput, CalculationError, compute_fte
-from config import ROLES
+from calculator import FTEInput, CalculationError, compute_fte_raw, aggregate_units
+from config import ROLES, MONTH_COLS, COST_RATE
 from data_loader import load_backend_data, BackendDataError
 
 st.set_page_config(
@@ -154,7 +154,17 @@ def get_backend():
 
 
 def format_number(x: float) -> str:
+    """Format bilangan bulat (dipakai untuk hasil yang SUDAH dibulatkan, mis. Total Agregat)."""
     return f"{x:,.0f}".replace(",", ".")
+
+
+def format_number_raw(x: float) -> str:
+    """Format 2 desimal ala Indonesia (titik ribuan, koma desimal) — dipakai untuk
+    nilai RAW/mentah per-unit yang MEMANG belum dibulatkan (sama seperti baris
+    10:46 di sheet 'Final Calculation', yang juga tidak dibulatkan)."""
+    s = f"{x:,.2f}"
+    integer_part, _, decimal_part = s.partition(".")
+    return f"{integer_part.replace(',', '.')},{decimal_part}"
 
 
 def format_currency(x: float) -> str:
@@ -162,11 +172,23 @@ def format_currency(x: float) -> str:
 
 
 def render_fte_table(fte_table: Dict[str, Dict[str, float]]):
+    """Tabel FTE yang SUDAH dibulatkan (dipakai untuk Total Agregat)."""
     rows = []
     for role in ROLES + ["Total"]:
         r = fte_table[role]
         rows.append({"FTE": role, "M1": format_number(r["M1"]), "M2": format_number(r["M2"]),
                      "M3": format_number(r["M3"]), "Tot": format_number(r["Tot"])})
+    st.dataframe(pd.DataFrame(rows).set_index("FTE"), width="stretch")
+
+
+def render_fte_table_raw(fte_table: Dict[str, Dict[str, float]]):
+    """Tabel FTE RAW/belum dibulatkan (dipakai untuk Hasil Per-Unit, persis
+    baris 10:46 di sheet Excel yang juga tidak dibulatkan per baris)."""
+    rows = []
+    for role in ROLES + ["Total"]:
+        r = fte_table[role]
+        rows.append({"FTE": role, "M1": format_number_raw(r["M1"]), "M2": format_number_raw(r["M2"]),
+                     "M3": format_number_raw(r["M3"]), "Tot": format_number_raw(r["Tot"])})
     st.dataframe(pd.DataFrame(rows).set_index("FTE"), width="stretch")
 
 
@@ -228,14 +250,6 @@ def main():
     with site_placeholder:
         site = st.selectbox("Site", options=sites if sites else ["-"])
 
-    with st.expander("🔧 Debug BACKEND (buka jika ada error 'Sub Category tidak ditemukan')"):
-        st.write("Jumlah Sub Category terbaca:", len(sub_opts))
-        st.code("\n".join(repr(x) for x in backend.load_factor.index.tolist()))
-        st.write("RACI:", backend.raci, "| Sites:", backend.sites)
-        if st.button("🔄 Clear cache & reload BACKEND"):
-            st.cache_data.clear()
-            st.rerun()
-
     st.markdown('<div class="page-eyebrow">Perhitungan</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-title">FTE &amp; Cost Estimator</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-subtitle">Isi daftar unit di bawah, lalu klik Hitung FTE untuk melihat estimasi Mechanic / Electric / Welder per shift.</div>', unsafe_allow_html=True)
@@ -273,9 +287,15 @@ def main():
             st.error("Tidak ada unit valid untuk dihitung. Pilih Sub Category minimal 1 baris.")
             return
 
+        # ── Skema round disamakan dengan sheet "Final Calculation" ──
+        # 1) Hitung tiap unit TANPA pembulatan (compute_fte_raw) -> persis baris 10:46.
+        # 2) Jumlahkan seluruh raw itu, BARU dibulatkan SATU KALI (aggregate_units)
+        #    -> persis baris 47 (Summary Manpower), formula ROUND(SUM(...)).
+        # Ini beda dari skema lama yang round tiap unit dulu baru dijumlah -- itu
+        # bisa menghasilkan total yang berbeda dari sheet Excel karena
+        # round(a) + round(b) tidak selalu sama dengan round(a+b).
         per_row_results = []
-        agg_fte = {role: {"M1": 0.0, "M2": 0.0, "M3": 0.0, "Tot": 0.0} for role in ROLES + ["Total"]}
-        agg_cost = {role: {"M1": 0.0, "M2": 0.0, "M3": 0.0, "Tot": 0.0} for role in ROLES + ["Total"]}
+        raw_list = []
 
         for idx, r in df_exec.iterrows():
             orig_sc = backend.original_sub_name(r["sub_category"]) or r["sub_category"]
@@ -289,34 +309,44 @@ def main():
                 populasi=int(r.get("jumlah_unit", 1)),
             )
             try:
-                res = compute_fte(inputs, backend)
+                res = compute_fte_raw(inputs, backend)
             except CalculationError as exc:
                 st.error(f"Baris {idx + 1} gagal: {exc}")
                 return
 
             per_row_results.append((r.to_dict(), res))
-            for role in ROLES + ["Total"]:
-                for m in ("M1", "M2", "M3", "Tot"):
-                    agg_fte[role][m] += float(res["fte"][role][m])
-                    agg_cost[role][m] += float(res["cost"][role][m])
+            raw_list.append(res["raw"])
 
-        st.markdown('<div class="section-label">Hasil Per-Unit</div>', unsafe_allow_html=True)
+        agg = aggregate_units(raw_list)
+
+        st.markdown('<div class="section-label">Hasil Per-Unit (belum dibulatkan)</div>', unsafe_allow_html=True)
+        st.caption(
+            "Nilai di bawah ini masih desimal mentah — sama seperti baris per-unit di sheet "
+            "'Final Calculation' Excel, yang juga belum dibulatkan. Pembulatan baru diterapkan "
+            "satu kali pada Total Agregat di bawah."
+        )
         for i, (row_def, res) in enumerate(per_row_results, start=1):
             st.markdown(f'<div class="result-card"><div class="result-card-title">'
                         f'Unit #{i} — {row_def.get("sub_category")} / {row_def.get("jenis_unit")} '
                         f'(x{row_def.get("jumlah_unit")})</div></div>', unsafe_allow_html=True)
             c1, c2 = st.columns(2)
             with c1:
-                render_fte_table(res["fte"])
+                render_fte_table_raw(res["raw"])
             with c2:
-                render_cost_table(res["cost"])
+                cost_raw = {
+                    role: {m: res["raw"][role][m] * COST_RATE[m] for m in MONTH_COLS}
+                    for role in ROLES + ["Total"]
+                }
+                for role in ROLES + ["Total"]:
+                    cost_raw[role]["Tot"] = sum(cost_raw[role][m] for m in MONTH_COLS)
+                render_cost_table(cost_raw)
 
-        st.markdown('<div class="section-label">Total Agregat</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">Total Agregat (dibulatkan — ROUND(SUM(unit)))</div>', unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            render_fte_table(agg_fte)
+            render_fte_table(agg["fte"])
         with c2:
-            render_cost_table(agg_cost)
+            render_cost_table(agg["cost"])
 
 
 if __name__ == "__main__":
