@@ -166,6 +166,31 @@ def _parse_fraction_cell(cell) -> float:
     return v / 100.0 if v > 1.0 else v
 
 
+def _looks_like_html_or_error(raw: pd.DataFrame) -> Optional[str]:
+    """Deteksi kasus umum: Google mengembalikan halaman HTML (butuh izin/login)
+    alih-alih CSV asli. Mengembalikan pesan diagnosis jika terdeteksi, None jika aman."""
+    if raw is None or raw.empty:
+        return "Response kosong (0 baris)."
+    first_cell = str(raw.iat[0, 0]) if raw.shape[0] > 0 and raw.shape[1] > 0 else ""
+    lowered = first_cell.strip().lower()
+    if lowered.startswith("<!doctype") or lowered.startswith("<html") or "<html" in lowered:
+        return "Response berupa halaman HTML, bukan CSV — kemungkinan besar Google Sheets menolak akses (izin sharing belum 'Anyone with the link - Viewer')."
+    joined_sample = " ".join(str(x) for x in raw.head(10).values.flatten().tolist()).lower()
+    if "sign in" in joined_sample or "accounts.google.com" in joined_sample or "you need access" in joined_sample or "request access" in joined_sample:
+        return "Response berisi halaman login/permintaan akses Google — sheet belum di-share publik (View)."
+    if raw.shape[1] == 1 and raw.shape[0] < 5:
+        return "Response tidak terlihat seperti CSV multi-kolom yang valid."
+    return None
+
+
+def _raw_preview(raw: pd.DataFrame, n: int = 8) -> str:
+    try:
+        return raw.head(n).to_string(max_colwidth=40)
+    except Exception:
+        return "(gagal menampilkan preview)"
+
+
+
 def _find_title_row(df: pd.DataFrame, title: str, start: int = 0) -> Optional[int]:
     """Cari baris yang Kolom A-nya PERSIS sama dengan judul seksi (case/space-insensitive)."""
     t = title.strip().lower()
@@ -200,7 +225,13 @@ def parse_backend(raw: pd.DataFrame) -> BackendData:
     # =========================================================
     lf_title_idx = _find_title_row(df, "load factor")
     if lf_title_idx is None:
-        raise BackendDataError("Seksi 'Load Factor' tidak ditemukan di Kolom A BACKEND.")
+        html_issue = _looks_like_html_or_error(df)
+        preview = _raw_preview(df)
+        detail = f"\n\nKemungkinan penyebab: {html_issue}" if html_issue else ""
+        raise BackendDataError(
+            "Seksi 'Load Factor' tidak ditemukan di Kolom A BACKEND."
+            f"{detail}\n\nPreview 8 baris pertama data yang benar-benar diterima:\n{preview}"
+        )
 
     header_idx = lf_title_idx + 1
     while header_idx < len(df) and _is_blank_row(df, header_idx):
@@ -416,15 +447,40 @@ def load_backend_data(source: Optional[Union[str, pd.DataFrame]] = None) -> Back
         # Sumber Google Sheets — dibangun dari config.py, bukan hardcoded di sini.
         try:
             from config import SPREADSHEET_ID, BACKEND_SHEET_NAME, gsheet_csv_url
-            url = gsheet_csv_url(BACKEND_SHEET_NAME, SPREADSHEET_ID)
+            primary_url = gsheet_csv_url(BACKEND_SHEET_NAME, SPREADSHEET_ID)
+            spreadsheet_id = SPREADSHEET_ID
         except ImportError:
-            # fallback terakhir jika config.py tidak tersedia sama sekali
-            url = (
-                "https://docs.google.com/spreadsheets/d/"
-                "1YRvXt0AE-dVBVwRvLtsb57Qz8DYd9YbVQlVbRD31C7I/gviz/tq?tqx=out:csv&sheet=BACKEND"
-            )
-        raw = pd.read_csv(url, header=None, dtype=str)
-        return parse_backend(raw)
+            spreadsheet_id = "1YRvXt0AE-dVBVwRvLtsb57Qz8DYd9YbVQlVbRD31C7I"
+            primary_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet=BACKEND"
+
+        errors = []
+        try:
+            raw = pd.read_csv(primary_url, header=None, dtype=str)
+            return parse_backend(raw)
+        except BackendDataError as e:
+            errors.append(f"[gviz sheet-name URL] {e}")
+        except Exception as e:
+            errors.append(f"[gviz sheet-name URL] gagal fetch: {e}")
+
+        # Fallback: coba URL export berbasis gid spesifik tab BACKEND (kadang gviz
+        # butuh setting sharing yang berbeda dari endpoint export biasa).
+        known_backend_gid = "1437049322"
+        fallback_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={known_backend_gid}"
+        try:
+            raw = pd.read_csv(fallback_url, header=None, dtype=str)
+            return parse_backend(raw)
+        except BackendDataError as e:
+            errors.append(f"[export gid=0 fallback] {e}")
+        except Exception as e:
+            errors.append(f"[export gid=0 fallback] gagal fetch: {e}")
+
+        raise BackendDataError(
+            "Gagal memuat BACKEND dari kedua metode URL Google Sheets.\n\n"
+            + "\n\n".join(errors)
+            + "\n\nCek: (1) sheet sudah di-share 'Anyone with the link - Viewer', "
+              "(2) nama tab persis 'BACKEND' (config.BACKEND_SHEET_NAME), "
+              "(3) SPREADSHEET_ID di config.py masih benar."
+        )
 
     except BackendDataError:
         raise
