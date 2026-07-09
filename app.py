@@ -52,7 +52,8 @@ def main():
     try:
         backend = get_backend()
     except BackendDataError as exc:
-        st.error(f"Gagal memuat data BACKEND: {exc}")
+        st.error("Gagal memuat data BACKEND — detail diagnosa di bawah:")
+        st.code(str(exc))
         st.stop()
 
     sub_opts = backend.sub_categories or []
