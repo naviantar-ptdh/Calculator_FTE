@@ -48,13 +48,13 @@ if "units_df" not in st.session_state:
 
 def main():
    col1, col2 = st.columns([1, 8], vertical_alignment="center")
-    with col1:
+   with col1:
         st.image("logo_putih.png", width=70)
-    with col2:
+   with col2:
         st.title("FTE Calculator")
-    try:
+   try:
         backend = get_backend()
-    except BackendDataError as exc:
+   except BackendDataError as exc:
         st.error("Gagal memuat data BACKEND — detail diagnosa di bawah:")
         st.code(str(exc))
         st.stop()
