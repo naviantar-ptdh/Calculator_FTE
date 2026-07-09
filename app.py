@@ -18,13 +18,31 @@ st.set_page_config(
 )
 
 # ── Sumber logo ──
-# PENTING: memakai URL absolut ke GitHub (bukan path lokal "logo_putih.png"),
-# karena st.image()/path lokal gagal kalau file belum ter-commit persis di root
-# repo yang sedang di-deploy. URL ini menunjuk ke repo referensi Anda yang sudah
-# terbukti menampilkan logo dengan benar. Kalau Anda sudah commit logo_putih.png
-# langsung ke repo Calculator_FTE, ganti PRIMARY_LOGO_URL ke raw URL repo itu.
-PRIMARY_LOGO_URL = "https://raw.githubusercontent.com/naviantar-ptdh/Calculator_FTE/main/logo_putih.png"
-FALLBACK_LOGO_URL = "https://raw.githubusercontent.com/naviantar-ptdh/202605-centralized/main/logo_putih.png"
+# Prioritas 1: baca file lokal "logo_putih.png" dari root repo dan embed sebagai
+# base64 (data URI). Ini paling tahan banting -- TIDAK butuh koneksi internet
+# sama sekali saat render, jadi tidak akan gagal walau raw.githubusercontent.com
+# diblokir firewall/jaringan kantor (penyebab paling umum logo tak muncul).
+# Prioritas 2 (fallback kalau file lokal belum ter-commit): URL GitHub raw.
+import base64
+from pathlib import Path
+
+
+def _load_logo_data_uri() -> str | None:
+    here = Path(__file__).resolve().parent
+    for candidate in ("logo_putih.png", "assets/logo_putih.png", "static/logo_putih.png"):
+        p = here / candidate
+        if p.is_file():
+            try:
+                b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+                return f"data:image/png;base64,{b64}"
+            except Exception:
+                pass
+    return None
+
+
+_LOGO_DATA_URI = _load_logo_data_uri()
+_LOGO_FALLBACK_URL = "https://raw.githubusercontent.com/naviantar-ptdh/202605-centralized/main/logo_putih.png"
+LOGO_SRC = _LOGO_DATA_URI or _LOGO_FALLBACK_URL
 
 # ── Design tokens (selaras dengan HR Portal) ──
 OR = "#E8440A"
@@ -110,8 +128,8 @@ st.markdown(CSS, unsafe_allow_html=True)
 st.markdown(f"""
 <div class="nav">
     <div class="nav-brand">
-        <img src="{PRIMARY_LOGO_URL}" style="height:28px;width:auto;"
-             onerror="this.onerror=null;this.src='{FALLBACK_LOGO_URL}';" alt="PTDH Logo"/>
+        <img src="{LOGO_SRC}" style="height:28px;width:auto;"
+             onerror="this.style.display='none';" alt="PTDH Logo"/>
         <div class="nav-divider"></div>
         <div>
             <div class="nav-title">FTE Calculator</div>
@@ -120,6 +138,14 @@ st.markdown(f"""
     </div>
 </div>
 """, unsafe_allow_html=True)
+
+if not _LOGO_DATA_URI:
+    st.info(
+        "ℹ️ File **logo_putih.png** belum ditemukan di root repo ini, jadi logo sementara "
+        "dimuat dari URL GitHub eksternal (bisa gagal kalau diblokir jaringan). "
+        "Untuk hasil paling stabil: commit file `logo_putih.png` ke root repo `Calculator_FTE` Anda.",
+        icon="🖼️",
+    )
 
 
 @st.cache_data(ttl=600, show_spinner="Mengambil data referensi dari BACKEND...")
@@ -171,14 +197,36 @@ if "units_seed" not in st.session_state:
 
 
 def main():
+    # Sidebar dirender DULUAN, sebelum backend di-load — supaya field manual/statis
+    # (Competency Factor, Jarak KM) TETAP TAMPIL walau fetch BACKEND gagal.
+    # Sebelumnya sidebar baru muncul setelah backend sukses, jadi begitu BACKEND
+    # error, seluruh sidebar (termasuk field ini) ikut lenyap dari layar.
+    with st.sidebar:
+        st.header("General Parameters")
+        competency_factor = st.slider("Competency Factor Mechanic", 0.1, 1.0, 0.6, 0.01)
+        jarak_km = st.number_input("Jarak Rata-rata Area Kerja (KM)", min_value=0.0, value=10.0, step=0.5)
+        site_placeholder = st.empty()
+        st.markdown("---")
+        st.caption(
+            "💡 Anda bisa **copy-paste** langsung dari Excel/Sheets ke tabel di kanan "
+            "(blok sel di Excel → Ctrl+C → klik sel pertama tabel → Ctrl+V). "
+            "Setelah mengetik di sebuah sel, tekan **Enter/Tab** dulu untuk commit "
+            "sebelum klik 'Hitung FTE'."
+        )
+
     try:
         backend = get_backend()
     except BackendDataError as exc:
+        with site_placeholder:
+            st.text_input("Site", value="", disabled=True, help="Menunggu BACKEND berhasil dimuat...")
         st.error("Gagal memuat data BACKEND — detail diagnosa di bawah:")
         st.code(str(exc))
         st.stop()
 
     sub_opts = backend.sub_categories or []
+    sites = backend.sites or []
+    with site_placeholder:
+        site = st.selectbox("Site", options=sites if sites else ["-"])
 
     with st.expander("🔧 Debug BACKEND (buka jika ada error 'Sub Category tidak ditemukan')"):
         st.write("Jumlah Sub Category terbaca:", len(sub_opts))
@@ -188,23 +236,16 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
-    with st.sidebar:
-        st.header("General Parameters")
-        sites = backend.sites or []
-        site = st.selectbox("Site", options=sites if sites else ["-"])
-        competency_factor = st.slider("Competency Factor Mechanic", 0.1, 1.0, 0.6, 0.01)
-        jarak_km = st.number_input("Jarak (KM)", min_value=0.0, value=10.0, step=0.5)
-        st.markdown("---")
-        st.caption(
-            "💡 Anda bisa **copy-paste** langsung dari Excel/Sheets ke tabel di kanan "
-            "(blok sel di Excel → Ctrl+C → klik sel pertama tabel → Ctrl+V). "
-            "Setelah mengetik di sebuah sel, tekan **Enter/Tab** dulu untuk commit "
-            "sebelum klik 'Hitung FTE'."
-        )
-
     st.markdown('<div class="page-eyebrow">Perhitungan</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-title">FTE &amp; Cost Estimator</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-subtitle">Isi daftar unit di bawah, lalu klik Hitung FTE untuk melihat estimasi Mechanic / Electric / Welder per shift.</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-label">Parameter (D3:D6 di sheet Final Calculation)</div>', unsafe_allow_html=True)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Competency Factor", f"{competency_factor:.2f}")
+    m2.metric("Jarak Area Kerja", f"{jarak_km:.1f} km")
+    m3.metric("Lost Time (auto, Site)", f"{backend.lost_time.get(site, float('nan')):.2f}")
+    m4.metric("Ratio Shift (auto, Site)", f"{backend.ratio_shift.get(site, float('nan')):.2f}")
 
     st.markdown('<div class="section-label">Unit Entries</div>', unsafe_allow_html=True)
 
@@ -219,7 +260,7 @@ def main():
             "sub_category": st.column_config.SelectboxColumn(
                 "Sub Category", options=sub_opts, required=True,
             ),
-            "jenis_unit": st.column_config.TextColumn("Jenis Unit"),
+            "jenis_unit": st.column_config.TextColumn("Unit / Model (mis. R9200)"),
             "jumlah_unit": st.column_config.NumberColumn("Jumlah Unit", min_value=1, step=1),
             "pa_percent": st.column_config.NumberColumn("PA %", min_value=1, max_value=100, step=1),
         },
