@@ -124,6 +124,25 @@ def main():
     sub_opts = backend.sub_categories or []
     sites = backend.sites or []
 
+    # -- Debug panel: bandingkan nilai BACKEND yang BENAR-BENAR terbaca aplikasi --
+    with st.sidebar:
+        if st.button("🔄 Clear Cache & Reload BACKEND"):
+            get_backend.clear()
+            st.rerun()
+    with st.expander("🔍 Debug: Nilai BACKEND yang terbaca aplikasi (bandingkan dgn Google Sheet)"):
+        st.write("**Proporsi RACI**", backend.raci)
+        st.write("**Split Ratio Mechanic [M1,M2,M3]**", backend.split_mechanic)
+        st.write("**Split Ratio Welder [M1,M2]**", backend.split_welder)
+        st.write("**Split Ratio Electrician [M1,M2]**", backend.split_electrician)
+        st.write("**Ratio Shift per Site**", backend.ratio_shift)
+        st.write("**Lost Time per Site**", backend.lost_time)
+        st.dataframe(backend.load_factor, width="stretch")
+        st.caption(
+            "Jika salah satu nilai Mechanic di atas (RACI Mechanic, Split Ratio Mechanic, "
+            "atau kolom 'Load Mechanic') berbeda dari Google Sheet BACKEND yang sekarang, "
+            "klik 'Clear Cache & Reload BACKEND' di sidebar lalu hitung ulang."
+        )
+
     # Site selector (placed below header so it's prominent)
     site = st.selectbox("Site", options=sites if sites else ["-"])
 
